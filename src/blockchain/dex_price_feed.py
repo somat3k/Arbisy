@@ -160,16 +160,32 @@ class DEXPriceFeed:
 
     @staticmethod
     def _default_pools() -> List[Tuple[str, str]]:
-        """Well-known Polygon zkEVM pools (USDC/WETH, WMATIC/USDC, etc.)."""
-        return [
-            # (dex_name, pool_address)
-            # Uniswap V3 on Polygon zkEVM
-            ("uniswap_v3", "0x8c9b8e0e4b1e1e8e1e1e1e1e1e1e1e1e1e1e1e1e"),  # placeholder
-            # QuickSwap V3
-            ("quickswap_v3", "0x9b9e0e4b1e1e8e1e1e1e1e1e1e1e1e1e1e1e1e1e"),
-            # SushiSwap
-            ("sushiswap", "0x7a9c0e4b1e1e8e1e1e1e1e1e1e1e1e1e1e1e1e1e"),
-        ]
+        """
+        Return pool configs from the POOL_CONFIGS env var (comma-separated
+        ``dex_name:pool_address`` pairs), or an empty list when none are set.
+
+        Configure pools via the environment before starting:
+
+            POOL_CONFIGS=uniswap_v3:0x<addr1>,quickswap_v3:0x<addr2>
+
+        Known Polygon zkEVM pool addresses (examples — verify on-chain):
+          - QuickSwap V3 WETH/USDC:  0x2f9DCc...  (look up on QuickSwap explorer)
+          - Uniswap V3 WETH/USDC:    deploy varies (check Uniswap app)
+
+        Without a valid POOL_CONFIGS the feed runs in offline/mock mode.
+        """
+        import os
+        raw = os.getenv("POOL_CONFIGS", "")
+        if not raw:
+            return []
+        pools: List[Tuple[str, str]] = []
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if ":" not in entry:
+                continue
+            dex_name, pool_addr = entry.split(":", 1)
+            pools.append((dex_name.strip(), pool_addr.strip()))
+        return pools
 
     def _get_pool_contract(self, pool_address: str):
         checksum = Web3.to_checksum_address(pool_address)

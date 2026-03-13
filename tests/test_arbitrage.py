@@ -14,6 +14,11 @@ from src.arbitrage.matrix import ArbitrageMatrix
 from src.arbitrage.triangular import GraphEdge, TriangularArbitrage
 from src.blockchain.dex_price_feed import PoolPrice, sqrt_price_x96_to_price
 
+# Token address constants used across tests
+TEST_TOKEN_A = "0xAAA"
+TEST_TOKEN_B = "0xBBB"
+TEST_TOKEN_C = "0xCCC"
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -75,9 +80,9 @@ class TestTriangularArbitrage:
         """
         det = TriangularArbitrage(max_path_length=4)
         pools = [
-            make_pool("dex1", "0xpool1", "0xAAA", "0xBBB", 1.01),
-            make_pool("dex2", "0xpool2", "0xBBB", "0xCCC", 1.01),
-            make_pool("dex3", "0xpool3", "0xCCC", "0xAAA", 1.01),
+            make_pool("dex1", "0xpool1", TEST_TOKEN_A, TEST_TOKEN_B, 1.01),
+            make_pool("dex2", "0xpool2", TEST_TOKEN_B, TEST_TOKEN_C, 1.01),
+            make_pool("dex3", "0xpool3", TEST_TOKEN_C, TEST_TOKEN_A, 1.01),
         ]
         det.update_prices(pools)
         return det
@@ -95,7 +100,7 @@ class TestTriangularArbitrage:
 
     def test_find_opportunities_dfs(self) -> None:
         det = self._build_detector_with_cycle()
-        opps = det.find_cycles_dfs("0xaaa", min_profit_pct=0.1)
+        opps = det.find_cycles_dfs(TEST_TOKEN_A.lower(), min_profit_pct=0.1)
         assert len(opps) >= 1
         assert opps[0].estimated_profit_pct > 0.1
 
@@ -103,12 +108,12 @@ class TestTriangularArbitrage:
         # All rates = 1.0 → no cycle has product > 1 in any direction
         det = TriangularArbitrage()
         pools = [
-            make_pool("dex1", "0xpool1", "0xAAA", "0xBBB", 1.0),
-            make_pool("dex2", "0xpool2", "0xBBB", "0xCCC", 1.0),
-            make_pool("dex3", "0xpool3", "0xCCC", "0xAAA", 1.0),
+            make_pool("dex1", "0xpool1", TEST_TOKEN_A, TEST_TOKEN_B, 1.0),
+            make_pool("dex2", "0xpool2", TEST_TOKEN_B, TEST_TOKEN_C, 1.0),
+            make_pool("dex3", "0xpool3", TEST_TOKEN_C, TEST_TOKEN_A, 1.0),
         ]
         det.update_prices(pools)
-        opps = det.find_cycles_dfs("0xaaa", min_profit_pct=0.01)
+        opps = det.find_cycles_dfs(TEST_TOKEN_A.lower(), min_profit_pct=0.01)
         assert len(opps) == 0
 
     def test_empty_graph_returns_no_opportunities(self) -> None:

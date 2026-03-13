@@ -136,7 +136,7 @@ class FlashLoan:
             if i == 0:
                 tokens.append(Web3.to_checksum_address(hop.token_in))
             tokens.append(Web3.to_checksum_address(hop.token_out))
-            fees.append(hop.fee_bps * 100)  # bps → pool fee units
+            fees.append(hop.fee_bps * 100)  # bps → Uniswap V3 fee units (hundredths of a bps; e.g. 30 bps → 3000)
             is_v3.append(hop.is_v3)
 
         encoded = encode(

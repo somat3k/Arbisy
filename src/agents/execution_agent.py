@@ -27,6 +27,10 @@ from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
+# Approximate ETH price in USD used for gas cost estimation.
+# Update this constant or replace with a live price feed for production use.
+_ETH_PRICE_USD: float = 1800.0
+
 
 class ExecutionAgent(BaseAgent):
     """
@@ -138,7 +142,7 @@ class ExecutionAgent(BaseAgent):
         # ── ML score ──────────────────────────────────────────────────────
         ml_score, predicted_profit = self._inference.score(
             opportunity,
-            gas_cost_usd=gas_gwei * 150_000 * 1e-9 * 1800,  # rough USD estimate
+            gas_cost_usd=gas_gwei * 150_000 * 1e-9 * _ETH_PRICE_USD,  # rough USD estimate
             block_utilization_pct=50.0,
         )
         if ml_score < self._ml_threshold:
