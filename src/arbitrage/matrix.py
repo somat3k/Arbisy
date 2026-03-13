@@ -73,8 +73,13 @@ class ArbitrageMatrix:
         self._token_index = {t: i for i, t in enumerate(self._tokens)}
 
         n = len(self._tokens)
-        R = np.ones((n, n))           # self-rate = 1
-        D = np.empty((n, n), dtype=object)
+        # Off-diagonal initialised to 0 (= no edge).  Only the diagonal is 1
+        # (self-rate).  Using 1 for off-diagonal would create artificial free
+        # edges between every token pair, generating false arbitrage cycles.
+        R = np.zeros((n, n))
+        np.fill_diagonal(R, 1.0)
+        # Use None to mark cells with no known DEX; np.empty leaves garbage values.
+        D = np.full((n, n), None, dtype=object)
 
         for pp in pool_prices:
             i = self._token_index[pp.token0.lower()]
@@ -98,15 +103,22 @@ class ArbitrageMatrix:
     def _build_log_matrix(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         Return (L, next_hop) where:
-        - L[i,j] = -log(best_rate[i,j])  (or +inf if no direct path)
+        - L[i,j] = -log(best_rate[i,j])  (or +inf if no direct edge)
         - next_hop[i,j] = next token index on shortest i→j path
+
+        Off-diagonal entries in R are 0 when no pool connects the pair.
+        We must produce +inf (not -inf) for those cells so Floyd-Warshall
+        does not treat absent edges as free paths.
         """
         n = len(self._tokens)
         R = self._rate_matrix
 
-        # Replace 1.0 self-rates with 0.0 after transform (no movement)
+        # Build L: start with +inf everywhere, then fill in -log(rate) only
+        # where a real pool edge exists (R > 0 and off-diagonal).
+        L = np.full((n, n), np.inf)
+        mask = (R > 0) & (~np.eye(n, dtype=bool))
         with np.errstate(divide="ignore", invalid="ignore"):
-            L = -np.log(np.where(R > 0, R, np.inf))
+            L[mask] = -np.log(R[mask])
         np.fill_diagonal(L, 0.0)
 
         next_hop = np.full((n, n), -1, dtype=int)
@@ -122,15 +134,28 @@ class ArbitrageMatrix:
         L: np.ndarray,
         next_hop: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Run Floyd-Warshall in-place; return (dist, next_hop)."""
+        """Run Floyd-Warshall in-place; return (dist, next_hop).
+
+        Two separate improvement conditions are used:
+        - ``dist_improved`` (strict ``<``) drives distance relaxation so that
+          even tiny improvements accumulate correctly.
+        - ``path_improved`` uses a small epsilon to avoid floating-point noise
+          (e.g. ``-log(1.1) + log(1.1)`` ≈ -1.5e-17 instead of 0) from
+          incorrectly updating the predecessor matrix and corrupting paths.
+        """
+        _PATH_EPS = 1e-12  # minimum meaningful improvement for path tracking
+
         n = L.shape[0]
         dist = L.copy()
 
         for k in range(n):
             new_dist = dist[:, k:k+1] + dist[k:k+1, :]
-            improved = new_dist < dist
-            dist = np.where(improved, new_dist, dist)
-            next_hop = np.where(improved, next_hop[:, k:k+1], next_hop)
+            dist_improved = new_dist < dist
+            path_improved = new_dist < dist - _PATH_EPS
+            dist = np.where(dist_improved, new_dist, dist)
+            # Capture column k *before* reassignment to avoid aliasing issues
+            col_k = next_hop[:, k:k+1].copy()
+            next_hop = np.where(path_improved, col_k, next_hop)
 
         return dist, next_hop
 
@@ -156,6 +181,46 @@ class ArbitrageMatrix:
             if current == end:
                 break
         return path if path[-1] == end else None
+
+    def _trace_negative_cycle(
+        self,
+        i: int,
+        dist: np.ndarray,
+        next_hop: np.ndarray,
+    ) -> Optional[List[int]]:
+        """
+        Reconstruct a negative-weight cycle passing through node ``i``.
+
+        Because ``next_hop[i, i]`` is always -1 (the diagonal is never set),
+        ``_reconstruct_path(i, i, ...)`` returns None immediately.  Instead we
+        find the intermediate node ``k`` that gives the most negative
+        ``dist[i,k] + dist[k,i]``, reconstruct both halves, and join them.
+        """
+        n = len(self._tokens)
+        best_k = -1
+        best_w = 0.0
+
+        for k in range(n):
+            if k == i:
+                continue
+            if next_hop[i, k] == -1 or next_hop[k, i] == -1:
+                continue
+            w = float(dist[i, k]) + float(dist[k, i])
+            if w < best_w:
+                best_w = w
+                best_k = k
+
+        if best_k == -1:
+            return None
+
+        path_to_k = self._reconstruct_path(i, best_k, next_hop)
+        path_back = self._reconstruct_path(best_k, i, next_hop)
+
+        if path_to_k is None or path_back is None:
+            return None
+
+        # Combine: i → ... → k → ... → i (avoid duplicating k at the join)
+        return path_to_k + path_back[1:]
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -191,16 +256,23 @@ class ArbitrageMatrix:
             if profit_pct < min_profit_pct:
                 continue
 
-            # Reconstruct cycle: i → ... → i via next_hop
-            cycle_indices = self._reconstruct_path(i, i, next_hop)
+            # Reconstruct cycle: i → ... → i via dedicated cycle tracer.
+            # _reconstruct_path(i, i, ...) always fails because next_hop[i,i]=-1.
+            cycle_indices = self._trace_negative_cycle(i, dist, next_hop)
             if cycle_indices is None:
-                # Fallback: just report the token
-                cycle_indices = [i, i]
-
-            key = tuple(sorted(cycle_indices))
-            if key in seen:
+                log.debug("Could not reconstruct cycle for token %d — skipping", i)
                 continue
-            seen.add(key)
+
+            # Canonical key: rotate inner path to the smallest index,
+            # keeping direction (not sorting), to avoid collapsing distinct cycles.
+            inner = cycle_indices[:-1]  # drop the closing duplicate of start
+            if not inner:
+                continue
+            min_pos = min(range(len(inner)), key=lambda idx: inner[idx])
+            canonical = tuple(inner[min_pos:] + inner[:min_pos])
+            if canonical in seen:
+                continue
+            seen.add(canonical)
 
             token_names = [self._tokens[idx] for idx in cycle_indices]
             results.append(MatrixArbPath(

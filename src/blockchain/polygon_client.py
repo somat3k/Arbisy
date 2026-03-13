@@ -11,6 +11,7 @@ import asyncio
 from typing import Any, Dict, Optional
 
 from web3 import AsyncWeb3, Web3
+from web3.exceptions import TransactionNotFound
 from web3.middleware import ExtraDataToPOAMiddleware
 from web3.types import TxParams, Wei
 
@@ -127,15 +128,20 @@ class PolygonClient:
         """Return raw token balance (in wei-equivalent smallest unit)."""
         contract = self.get_erc20_contract(token_address)
         checksum_wallet = Web3.to_checksum_address(wallet)
-        return contract.functions.balanceOf(checksum_wallet).call()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, contract.functions.balanceOf(checksum_wallet).call
+        )
 
     async def get_token_decimals(self, token_address: str) -> int:
         contract = self.get_erc20_contract(token_address)
-        return contract.functions.decimals().call()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, contract.functions.decimals().call)
 
     async def get_token_symbol(self, token_address: str) -> str:
         contract = self.get_erc20_contract(token_address)
-        return contract.functions.symbol().call()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, contract.functions.symbol().call)
 
     # ── Transaction ───────────────────────────────────────────────────────────
 
@@ -158,9 +164,15 @@ class PolygonClient:
         """Poll for a transaction receipt; raises TimeoutError if too slow."""
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
-            receipt = await self.w3.eth.get_transaction_receipt(tx_hash)  # type: ignore[arg-type]
-            if receipt is not None:
-                return dict(receipt)
+            try:
+                receipt = await self.w3.eth.get_transaction_receipt(tx_hash)  # type: ignore[arg-type]
+                if receipt is not None:
+                    return dict(receipt)
+            except TransactionNotFound:
+                # Not yet mined — keep polling until timeout.
+                pass
+            except Exception as exc:
+                log.warning("Receipt poll error for %s: %s", tx_hash, exc)
             await asyncio.sleep(2)
         raise TimeoutError(f"Transaction {tx_hash} not mined within {timeout}s")
 

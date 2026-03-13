@@ -88,6 +88,9 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
     error DEXNotAllowed(address dex);
     error UnprofitableTrade(uint256 output, uint256 required);
     error InvalidPathLength();
+    error InvalidPathAsset(address expected, address got);
+    error ArrayLengthMismatch();
+    error MultiAssetNotSupported();
     error ExceedsMaxLoanAmount(uint256 requested, uint256 maximum);
     error ZeroAmount();
 
@@ -131,10 +134,11 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
         if (msg.sender != AAVE_POOL) revert OnlyAavePool();
         // Only operations initiated by this contract are valid
         if (initiator != address(this)) revert UnauthorizedInitiator();
+        // This contract supports single-asset flash loans only.
+        // Multi-asset borrows would require per-asset path encoding in params.
+        if (assets.length != 1) revert MultiAssetNotSupported();
 
-        for (uint256 i = 0; i < assets.length; i++) {
-            _executeArbitrage(assets[i], amounts[i], premiums[i], params);
-        }
+        _executeArbitrage(assets[0], amounts[0], premiums[0], params);
 
         return true;
     }
@@ -158,9 +162,17 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
             bool[]    memory isV3
         ) = ArbitrageLib.decodeSwapPath(params);
 
-        // Validate path: tokens must start and end with `asset`
+        // Validate path lengths and asset in/out invariant.
+        // tokens must satisfy: tokens[0] == asset (start) and
+        //                      tokens[tokens.length-1] == asset (close cycle).
+        // fees and isV3 must each have exactly dexRouters.length entries.
         if (tokens.length < 2) revert InvalidPathLength();
         if (dexRouters.length != tokens.length - 1) revert InvalidPathLength();
+        if (fees.length != dexRouters.length) revert ArrayLengthMismatch();
+        if (isV3.length != dexRouters.length) revert ArrayLengthMismatch();
+        if (tokens[0] != asset) revert InvalidPathAsset(asset, tokens[0]);
+        if (tokens[tokens.length - 1] != asset)
+            revert InvalidPathAsset(asset, tokens[tokens.length - 1]);
 
         // Execute each hop
         uint256 currentAmount = loanAmount;
@@ -194,7 +206,11 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
         // Approve the Aave Pool to pull back loan + premium
         IERC20(asset).approve(AAVE_POOL, repay);
 
-        emit ArbitrageExecuted(asset, loanAmount, repay, profit, tx.origin);
+        // Emit `owner` as initiator: `owner` is declared `immutable` (set once
+        // in the constructor and never changeable), so it unambiguously identifies
+        // the account that deployed and controls this contract.  Using `tx.origin`
+        // would be unsafe when called via a smart-account or relayer.
+        emit ArbitrageExecuted(asset, loanAmount, repay, profit, owner);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

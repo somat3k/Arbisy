@@ -75,7 +75,7 @@ RELEASE    ExecutionAgent calls FlashLoanArbitrage.initiateFlashLoan()
 - [ ] Seed `MLModel` with real historical trade data and retrain
 - [ ] Add WebSocket subscription to Uniswap V3 `Swap` events for sub-block detection
 - [ ] Implement proper gas estimation with EIP-1559 support
-- [ ] Add circuit-breaker: halt execution if 3 consecutive losses occur
+- [x] Add circuit-breaker: halt execution if 3 consecutive losses occur *(implemented in `ExecutionAgent._consecutive_losses`)*
 - [ ] Add slippage protection (max 0.5% slippage per hop)
 
 ### MEDIUM Priority
@@ -138,3 +138,111 @@ RELEASE    ExecutionAgent calls FlashLoanArbitrage.initiateFlashLoan()
 4. **OpenAI** — tertiary fallback
 
 Agents rotate providers on rate-limit (HTTP 429) errors.
+
+---
+
+## EPICS
+
+The following epics capture the major work streams required to take Arbisy
+from prototype to production.  Each epic contains a set of user stories that
+together deliver a releasable capability.
+
+---
+
+### EPIC 1 — On-Chain Infrastructure
+
+> **Goal:** Deploy and verify the `FlashLoanArbitrage` smart contract on
+> Polygon zkEVM and connect all off-chain components to the live contract.
+
+**Stories:**
+- [ ] **E1-S1** Set up Hardhat project with `FlashLoanArbitrage.sol` compilation and local fork test.
+- [ ] **E1-S2** Write Hardhat/Foundry integration tests: mock Aave Pool, mock DEX routers, verify `executeOperation` reverts on unprofitable trade.
+- [ ] **E1-S3** Deploy `FlashLoanArbitrage.sol` to Polygon zkEVM testnet (Goerli / Cardona); verify DEX whitelist and `simulateProfit()`.
+- [ ] **E1-S4** Deploy to Polygon zkEVM mainnet; record contract address in `.env` and `AGENTS.md`.
+- [ ] **E1-S5** Implement an upgrade/proxy pattern (OpenZeppelin TransparentProxy) to allow parameter changes post-deployment.
+
+---
+
+### EPIC 2 — Real-Time Price Feed
+
+> **Goal:** Replace the offline/mock price feed with live on-chain data and
+> WebSocket event subscriptions for sub-block latency.
+
+**Stories:**
+- [ ] **E2-S1** Populate `POOL_CONFIGS` with verified QuickSwap V3, Uniswap V3, and SushiSwap pool addresses on Polygon zkEVM mainnet.
+- [ ] **E2-S2** Implement WebSocket subscription to Uniswap V3 `Swap` events via `AsyncWeb3` for sub-block opportunity detection.
+- [ ] **E2-S3** Add a `DEXFactory` scanner that auto-discovers new pools for configured token pairs using the V3 `PoolCreated` event.
+- [ ] **E2-S4** Expand the token universe: MATIC, WBTC, LINK, AAVE, DAI, USDT pools.
+- [ ] **E2-S5** Add SushiSwap V3 pool ABI and integrate into `DEXPriceFeed`.
+
+---
+
+### EPIC 3 — ML Model Production Quality
+
+> **Goal:** Replace the synthetic-data bootstrap model with one trained on
+> real historical execution data and delivered with continuous retraining.
+
+**Stories:**
+- [ ] **E3-S1** Persist opportunity and execution logs to PostgreSQL (`executions` table with all feature columns and `net_profit_usd` label).
+- [ ] **E3-S2** Build an ETL pipeline that extracts features from the PostgreSQL log into a training dataset.
+- [ ] **E3-S3** Tune `GradientBoostingRegressor` hyperparameters via `GridSearchCV` on 90-day lookback window.
+- [ ] **E3-S4** Set up a weekly cron job that retrains the model and replaces `models/arbitrage_model.joblib`.
+- [ ] **E3-S5** Add a model evaluation dashboard: RMSE, R², feature importances (Prometheus + Grafana or FastAPI endpoint).
+- [ ] **E3-S6** Explore a secondary `RandomForestRegressor` ensemble for variance reduction.
+
+---
+
+### EPIC 4 — Execution Reliability
+
+> **Goal:** Harden the execution pipeline so that no money is lost to gas
+> waste, RPC failures, or adverse market conditions.
+
+**Stories:**
+- [ ] **E4-S1** Implement EIP-1559 gas estimation: cap `maxFeePerGas` at `MAX_GAS_PRICE_GWEI`; skip execution if base fee exceeds threshold.
+- [ ] **E4-S2** Add per-hop slippage protection: compute `amountOutMinimum` from expected output minus 0.5% and pass to DEX swap functions.
+- [ ] **E4-S3** Implement exponential back-off retry in `ExecutionAgent` for RPC transient errors (up to 3 retries, max 8 s delay).
+- [ ] **E4-S4** Add a nonce management service that serialises concurrent transaction submissions and handles stuck transactions.
+- [ ] **E4-S5** Implement MEV protection: submit transactions via Flashbots-compatible private mempool on zkEVM (or a bundler service).
+- [ ] **E4-S6** Extend the circuit-breaker: persist loss streaks across restarts; alert on Slack/Telegram after circuit trips.
+
+---
+
+### EPIC 5 — Observability & Operations
+
+> **Goal:** Give operators full visibility into system health, opportunity
+> quality, and P&L in real time.
+
+**Stories:**
+- [ ] **E5-S1** Add a Prometheus metrics endpoint (`/metrics`) exposing: `cycle_duration_ms`, `opportunities_found_total`, `executions_total`, `profit_usd_total`, `ml_score_histogram`.
+- [ ] **E5-S2** Build a Grafana dashboard with panels for: rolling P&L, ML score distribution, gas cost trend, circuit-breaker status.
+- [ ] **E5-S3** Implement structured JSON logging (via `python-json-logger`) and ship logs to a centralised store (e.g., Loki, CloudWatch).
+- [ ] **E5-S4** Build a minimal FastAPI + WebSocket dashboard: live opportunity feed, execution log, current model metrics.
+- [ ] **E5-S5** Add health-check endpoint (`/healthz`) that verifies RPC connectivity and contract reachability; integrate with a watchdog (systemd / Docker).
+
+---
+
+### EPIC 6 — Advanced Arbitrage Strategies
+
+> **Goal:** Expand the opportunity search space beyond simple triangular and
+> cross-platform pairs.
+
+**Stories:**
+- [ ] **E6-S1** Implement 4-leg (quad-hop) arbitrage paths in the matrix solver and wire them through the execution pipeline.
+- [ ] **E6-S2** Add Balancer V2 pool support: weighted pool price calculation and swap path encoding.
+- [ ] **E6-S3** Add Curve Finance stable-swap pool support: invariant-based price calculation.
+- [ ] **E6-S4** Explore cross-chain arbitrage via bridges (e.g., Polygon mainnet &lt;-&gt; zkEVM) as a future research item.
+- [ ] **E6-S5** Evaluate a reinforcement-learning agent (using `stable-baselines3` sklearn-compatible wrapper) as an upgrade path for the ML model.
+
+---
+
+### EPIC 7 — Security Hardening
+
+> **Goal:** Ensure the system is robust against adversarial on-chain
+> conditions and off-chain configuration errors.
+
+**Stories:**
+- [ ] **E7-S1** Commission an independent security audit of `FlashLoanArbitrage.sol`.
+- [ ] **E7-S2** Implement replay protection: include a nonce in ABI-encoded `params`; reject calls with an already-used nonce.
+- [ ] **E7-S3** Add a pause mechanism (`Pausable`) to the contract: owner can halt all flash-loan execution instantly.
+- [ ] **E7-S4** Restrict `withdrawToken` to a configurable allow-list of destination addresses.
+- [ ] **E7-S5** Add a maxSlippage parameter to the contract; revert inside `executeOperation` if slippage exceeds the on-chain limit.

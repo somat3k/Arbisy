@@ -69,6 +69,10 @@ class ArbitrageModel:
             except Exception as exc:
                 log.warning("Failed to load model from %s: %s", self._model_path, exc)
 
+    def reload(self) -> None:
+        """Reload the persisted model from disk, replacing the current weights."""
+        self._load_if_exists()
+
     def save(self, path: Optional[str] = None) -> str:
         """Persist model + scaler to disk; return the saved path."""
         save_path = path or self._model_path

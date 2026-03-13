@@ -88,3 +88,16 @@ class LiveInference:
     def record_outcome(self, arb_type: str, success: bool) -> None:
         """Feed execution result back to the feature engineer for the success-rate feature."""
         self.fe.record_outcome(arb_type, success)
+
+    def reload(self) -> None:
+        """
+        Reload the persisted model from disk into this instance.
+
+        Call this after training completes so that any agent holding a
+        reference to this ``LiveInference`` object immediately benefits from
+        the updated model without needing to be re-wired.
+        """
+        self.model.reload()
+        log.info(
+            "LiveInference reloaded — model trained=%s", self.model.trained
+        )

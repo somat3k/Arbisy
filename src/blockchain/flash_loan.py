@@ -196,30 +196,21 @@ class FlashLoan:
             nonce  = await self._client.get_nonce(self._wallet)
             fee_params = await self._client.get_max_fee_params()
 
-            if len(opportunity.path) == 1:
-                # Single-asset simple flash loan
-                tx = self._contract.functions.initiateFlashLoanSimple(
-                    Web3.to_checksum_address(opportunity.asset),
-                    opportunity.loan_amount_wei,
-                    params,
-                ).build_transaction({
-                    "from":  Web3.to_checksum_address(self._wallet),
-                    "nonce": nonce,
-                    "gas":   800_000,
-                    **fee_params,
-                })
-            else:
-                assets  = [Web3.to_checksum_address(opportunity.asset)]
-                amounts = [opportunity.loan_amount_wei]
-                modes   = [0]
-                tx = self._contract.functions.initiateFlashLoan(
-                    assets, amounts, modes, params
-                ).build_transaction({
-                    "from":  Web3.to_checksum_address(self._wallet),
-                    "nonce": nonce,
-                    "gas":   1_200_000,
-                    **fee_params,
-                })
+            # Always use initiateFlashLoanSimple for single-asset borrows.
+            # The "simple" variant is cheaper and is the correct choice whenever
+            # we borrow exactly one asset (regardless of the number of swap hops).
+            # initiateFlashLoan (multi-asset) is reserved for borrowing multiple
+            # *different* tokens simultaneously — not needed for arbitrage.
+            tx = self._contract.functions.initiateFlashLoanSimple(
+                Web3.to_checksum_address(opportunity.asset),
+                opportunity.loan_amount_wei,
+                params,
+            ).build_transaction({
+                "from":  Web3.to_checksum_address(self._wallet),
+                "nonce": nonce,
+                "gas":   800_000,
+                **fee_params,
+            })
 
             tx_hash = await self._client.send_transaction(tx, self._private_key)
             log.info("Flash loan tx submitted: %s", tx_hash)

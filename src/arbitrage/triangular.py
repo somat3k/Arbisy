@@ -125,7 +125,11 @@ class TriangularArbitrage:
         pred: List[Optional[int]] = [None] * n
         pred_edge: List[Optional[GraphEdge]] = [None] * n
 
-        dist[idx.get(source, 0)] = 0.0
+        if source not in idx:
+            # Token not in the graph; nothing to search from.
+            return None
+
+        dist[idx[source]] = 0.0
 
         for _ in range(n - 1):
             for src, targets in self._graph.items():
@@ -214,10 +218,18 @@ class TriangularArbitrage:
             if cycle is None:
                 continue
 
-            key = "→".join(sorted(cycle))
-            if key in seen_cycles:
+            # Canonical key: rotate the cycle to start at the lexicographically
+            # smallest token while preserving direction.  Sorting would collapse
+            # A→B→C→A and A→C→B→A (different direction, different profitability)
+            # into the same key — we must keep direction.
+            inner = cycle[:-1]  # drop the closing duplicate of the first token
+            if not inner:
                 continue
-            seen_cycles.add(key)
+            min_idx = min(range(len(inner)), key=lambda i: inner[i])
+            canonical = "→".join(inner[min_idx:] + inner[:min_idx])
+            if canonical in seen_cycles:
+                continue
+            seen_cycles.add(canonical)
 
             path = self._build_arb_path(cycle)
             if path and path.estimated_profit_pct >= min_profit_pct:

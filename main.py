@@ -111,7 +111,10 @@ class ArbisyOrchestrator:
                 use_real_data=False,
                 synthetic_samples=2000,
             ))
-            self._inference = LiveInference()  # reload fresh model
+            # Reload the trained model into the *existing* LiveInference instance.
+            # ExecutionAgent holds a reference to the same object, so it will
+            # automatically start using the fresh model without re-wiring.
+            self._inference.reload()
 
     async def _verify_connection(self) -> None:
         connected = await self._client.is_connected()
