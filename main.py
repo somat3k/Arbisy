@@ -45,7 +45,7 @@ from src.payload.protocol import (
     SystemEventPayload,
 )
 from src.utils.config import get_config
-from src.utils.dashboard import dashboard_manager, record_execution, record_opportunity
+from src.utils.dashboard import dashboard_manager, record_execution, record_opportunity, set_running
 from src.utils.db import ExecutionDB, get_db
 from src.utils.logger import get_logger
 
@@ -224,7 +224,7 @@ class ArbisyOrchestrator:
                     "token_in":  opp.tokens[i],
                     "token_out": opp.tokens[i + 1],
                     "dex_name":  opp.dexes[i],
-                    "router_address": "0x0",  # resolved from dex_name at execution time
+                    "router_address": "0x" + "0" * 40,  # resolved from dex_name at execution time
                     "fee_bps":   30,
                     "is_v3":     True,
                     "estimated_amount_out": 0.0,
@@ -256,7 +256,7 @@ class ArbisyOrchestrator:
                         "token_in":  opp.token_a,
                         "token_out": opp.token_b,
                         "dex_name":  opp.buy_dex,
-                        "router_address": "0x0",
+                        "router_address": "0x" + "0" * 40,
                         "fee_bps":   opp.buy_fee_bps,
                         "is_v3":     True,
                         "estimated_amount_out": 0.0,
@@ -265,7 +265,7 @@ class ArbisyOrchestrator:
                         "token_in":  opp.token_b,
                         "token_out": opp.token_a,
                         "dex_name":  opp.sell_dex,
-                        "router_address": "0x0",
+                        "router_address": "0x" + "0" * 40,
                         "fee_bps":   opp.sell_fee_bps,
                         "is_v3":     True,
                         "estimated_amount_out": 0.0,
@@ -287,7 +287,7 @@ class ArbisyOrchestrator:
             candidates.append({
                 "arb_type":              "matrix",
                 "estimated_profit_pct":  opp.profit_pct,
-                "asset":                 opp.token_names[0] if opp.token_names else "0x0",
+                "asset":                 opp.token_names[0] if opp.token_names else "0x" + "0" * 40,
                 "loan_amount_usd":       10_000.0,
                 "loan_amount_wei":       10_000 * 10**6,
                 "dex_sources":           dex_sources,
@@ -313,7 +313,7 @@ class ArbisyOrchestrator:
                     "token_in":             pa.token_path[i],
                     "token_out":            pa.token_path[i + 1],
                     "dex_name":             pa.dex_path[i],
-                    "router_address":       "0x0",
+                    "router_address":       "0x" + "0" * 40,
                     "fee_bps":              pa.fee_path[i] if i < len(pa.fee_path) else 30,
                     "is_v3":                True,
                     "estimated_amount_out": pa.final_usd if i == len(pa.dex_path) - 1 else 0.0,

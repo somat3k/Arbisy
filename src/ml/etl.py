@@ -32,15 +32,23 @@ from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
-# Mapping from DB column name → position in FEATURE_NAMES
-# DB stores the seven core observable features; derived features default to 0
+# Mapping from DB column name → position in FEATURE_NAMES.
+# DB columns that need a log10 transform are listed in _LOG_COLUMNS.
 _DB_TO_FEATURE_IDX = {
-    "price_spread_pct":      FEATURE_NAMES.index("price_spread_pct"),
-    "gas_cost_usd":          FEATURE_NAMES.index("gas_cost_usd"),
+    "price_spread_pct":        FEATURE_NAMES.index("price_spread_pct"),
+    "gas_cost_usd":            FEATURE_NAMES.index("gas_cost_usd"),
     "historical_success_rate": FEATURE_NAMES.index("historical_success_rate"),
-    "slippage_estimate":     FEATURE_NAMES.index("slippage_estimate_pct"),
-    "block_utilization":     FEATURE_NAMES.index("block_utilization_pct"),
+    "slippage_estimate":       FEATURE_NAMES.index("slippage_estimate_pct"),
+    "block_utilization":       FEATURE_NAMES.index("block_utilization_pct"),
+    # liquidity_depth (raw balance sum) → liquidity_depth_log (log10 transform)
+    "liquidity_depth":         FEATURE_NAMES.index("liquidity_depth_log"),
+    # Note: time_since_last_trade has no direct FEATURE_NAMES equivalent.
+    # The model uses cyclic time-of-day sin/cos derived at inference time,
+    # not time-since-last-trade, so this DB column is intentionally excluded.
 }
+
+# DB columns requiring a log10(max(1, x)) transform before placement in X
+_LOG_COLUMNS: set = {"liquidity_depth"}
 
 _LABEL_COLUMN = "net_profit_usd"
 
@@ -101,7 +109,11 @@ async def load_training_data(
     # Build full-width feature matrix, mapping DB columns to their FEATURE_NAMES positions
     X = np.zeros((n, N_FEATURES), dtype=float)
     for col, idx in _DB_TO_FEATURE_IDX.items():
-        X[:, idx] = df[col].fillna(0.0).to_numpy(dtype=float)
+        values = df[col].fillna(0.0).to_numpy(dtype=float)
+        if col in _LOG_COLUMNS:
+            # Apply log10 transform; clamp to 1 to avoid log(0)
+            values = np.log10(np.maximum(values, 1.0))
+        X[:, idx] = values
 
     y = df[_LABEL_COLUMN].to_numpy(dtype=float)
 

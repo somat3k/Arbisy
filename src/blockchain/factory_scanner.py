@@ -135,13 +135,18 @@ class DEXFactoryScanner:
             factory = self._get_factory(factory_addr)
 
             for token_a, token_b in token_pairs:
+                # UniswapV3-style factories require token0 < token1 (lexicographic address order)
+                ta_cs = Web3.to_checksum_address(token_a)
+                tb_cs = Web3.to_checksum_address(token_b)
+                # Sort so the getPool call always matches how the factory indexes the pair
+                t0_cs, t1_cs = (ta_cs, tb_cs) if ta_cs.lower() < tb_cs.lower() else (tb_cs, ta_cs)
                 for fee in tiers:
                     try:
                         pool_addr = await loop.run_in_executor(
                             None,
                             factory.functions.getPool(
-                                Web3.to_checksum_address(token_a),
-                                Web3.to_checksum_address(token_b),
+                                t0_cs,
+                                t1_cs,
                                 fee,
                             ).call,
                         )
@@ -150,10 +155,9 @@ class DEXFactoryScanner:
                         if pool_addr.lower() in self._known_pools:
                             continue
                         self._known_pools.add(pool_addr.lower())
-                        # The factory stores token0 < token1 (sorted by address)
-                        ta_low = token_a.lower()
-                        tb_low = token_b.lower()
-                        t0, t1 = (ta_low, tb_low) if ta_low < tb_low else (tb_low, ta_low)
+                        # Record the canonical (sorted) token order
+                        t0 = t0_cs.lower()
+                        t1 = t1_cs.lower()
                         pool = DiscoveredPool(
                             dex_name=dex_name,
                             pool_address=pool_addr,

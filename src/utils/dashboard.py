@@ -30,7 +30,7 @@ import asyncio
 import json
 import time
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Set
+from typing import Any, Deque, Dict, List, Optional
 
 from src.utils.logger import get_logger
 
@@ -62,8 +62,12 @@ _system_status:   Dict[str, Any] = {
     "circuit_breaker_tripped": False,
 }
 
-# Active WebSocket connections
-_connections: Set[WebSocket] = set()
+# Active WebSocket connections: map ws → send queue
+# Each connection gets its own asyncio.Queue so that _broadcast enqueues
+# messages and a dedicated per-connection sender task dequeues them.
+# This avoids concurrent send_text() calls on the same WebSocket, which
+# Starlette/FastAPI does not support.
+_connection_queues: Dict["WebSocket", "asyncio.Queue[Optional[str]]"] = {}
 
 
 # ── Public API used by the orchestrator ───────────────────────────────────────
@@ -111,17 +115,19 @@ def set_running(running: bool) -> None:
 # ── WebSocket broadcast ───────────────────────────────────────────────────────
 
 async def _broadcast(message: Dict[str, Any]) -> None:
-    """Broadcast a JSON event to all connected WebSocket clients."""
-    if not _connections:
+    """Enqueue a JSON event onto every connected WebSocket's send queue.
+
+    Each connection drains its own queue in a dedicated sender coroutine,
+    so concurrent sends on the same socket are avoided entirely.
+    """
+    if not _connection_queues:
         return
     text = json.dumps(message, default=str)
-    dead: Set[WebSocket] = set()
-    for ws in list(_connections):
+    for queue in list(_connection_queues.values()):
         try:
-            await ws.send_text(text)
-        except Exception:
-            dead.add(ws)
-    _connections.difference_update(dead)
+            queue.put_nowait(text)
+        except asyncio.QueueFull:
+            pass  # slow consumer — drop this message rather than block
 
 
 def _schedule_broadcast(message: Dict[str, Any]) -> None:
@@ -224,19 +230,43 @@ function addFeedRow(data) {
   const tr = document.createElement("tr");
   const ts = new Date((data._ts || Date.now() / 1000) * 1000).toLocaleTimeString();
   const type = data._event || "?";
-  let details = "";
-  let result = "";
-  if (type === "opportunity") {
-    details = (data.arb_type || "") + " | score=" + (data.ml_score || 0).toFixed(3) +
-              " | $" + (data.expected_profit_usd || 0).toFixed(2);
-    result = '<span class="yellow">PENDING</span>';
-  } else if (type === "execution") {
-    details = data.tx_hash ? data.tx_hash.slice(0, 12) + "..." : "(no tx)";
-    result = data.success
-      ? '<span class="green">✓ $' + (data.actual_profit_usd || 0).toFixed(2) + '</span>'
-      : '<span class="red">✗ ' + (data.error_message || "failed") + '</span>';
+
+  // Build cells using DOM APIs (textContent) to avoid XSS.
+  function td(text) {
+    const cell = document.createElement("td");
+    cell.textContent = text;
+    return cell;
   }
-  tr.innerHTML = "<td>" + ts + "</td><td>" + type + "</td><td>" + details + "</td><td>" + result + "</td>";
+  function tdSpan(text, cls) {
+    const cell = document.createElement("td");
+    const span = document.createElement("span");
+    span.className = cls;
+    span.textContent = text;
+    cell.appendChild(span);
+    return cell;
+  }
+
+  tr.appendChild(td(ts));
+  tr.appendChild(td(type));
+
+  if (type === "opportunity") {
+    const details = (data.arb_type || "") + " | score=" + (data.ml_score || 0).toFixed(3) +
+                    " | $" + (data.expected_profit_usd || 0).toFixed(2);
+    tr.appendChild(td(details));
+    tr.appendChild(tdSpan("PENDING", "yellow"));
+  } else if (type === "execution") {
+    const txShort = data.tx_hash ? data.tx_hash.slice(0, 12) + "..." : "(no tx)";
+    tr.appendChild(td(txShort));
+    if (data.success) {
+      tr.appendChild(tdSpan("✓ $" + (data.actual_profit_usd || 0).toFixed(2), "green"));
+    } else {
+      tr.appendChild(tdSpan("✗ " + (data.error_message || "failed"), "red"));
+    }
+  } else {
+    tr.appendChild(td(""));
+    tr.appendChild(td(""));
+  }
+
   tbody.insertBefore(tr, tbody.firstChild);
   // Keep only 50 rows in the DOM
   while (tbody.rows.length > 50) tbody.deleteRow(tbody.rows.length - 1);
@@ -273,18 +303,33 @@ if _HAS_FASTAPI:
     @app.websocket("/ws/feed")
     async def ws_feed(websocket: WebSocket):
         await websocket.accept()
-        _connections.add(websocket)
-        try:
+        queue: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=256)
+        _connection_queues[websocket] = queue
+
+        async def _sender() -> None:
+            """Drain the per-connection queue and send messages one at a time."""
             while True:
-                # Keep alive — client drives the connection
-                await asyncio.sleep(30)
-                await websocket.send_text(json.dumps({"_event": "ping"}))
+                text = await queue.get()
+                if text is None:   # sentinel — shut down sender
+                    break
+                try:
+                    await websocket.send_text(text)
+                except Exception:
+                    break
+
+        sender_task = asyncio.create_task(_sender(), name="ws_sender")
+        try:
+            # Block until the client disconnects; all sends go through the queue
+            await websocket.receive_text()
         except WebSocketDisconnect:
             pass
         except Exception:
             pass
         finally:
-            _connections.discard(websocket)
+            _connection_queues.pop(websocket, None)
+            # Signal the sender to stop and await its completion
+            queue.put_nowait(None)
+            await sender_task
 
 else:
     # Stub so imports don't break when fastapi is absent

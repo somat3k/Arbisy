@@ -1,15 +1,22 @@
 """
-Real-time Uniswap V3 Swap event subscription (E2-S2).
+Real-time Uniswap V3 Swap event polling (E2-S2).
 
-Subscribes to the ``Swap`` event emitted by V3-compatible pool contracts via
-an AsyncWeb3 WebSocket connection.  Each swap triggers a price update and an
-optional callback, enabling sub-block opportunity detection without polling.
+Monitors ``Swap`` events emitted by V3-compatible pool contracts by
+periodically calling ``eth_getLogs`` on an HTTP RPC endpoint.  Each
+new swap triggers a price-update callback, enabling sub-block opportunity
+detection at configurable poll intervals (default 0.5 s).
+
+Note: The implementation uses ``eth_getLogs`` polling rather than a true
+WebSocket ``eth_subscribe`` because most commercial RPC providers do not
+support ``eth_subscribe`` for zkEVM endpoints, or charge extra for it.
+To switch to a genuine WS subscription, replace ``_poll_swap_logs`` with
+``w3.eth.subscribe("logs", filter)`` and wire ``client.ws_url`` instead of
+``client.rpc_url`` in ``subscribe()``.
 
 Usage
 -----
     feed = SwapEventFeed(client, on_price_update=my_callback)
-    async with feed.subscribe(pool_addresses):
-        await asyncio.sleep(3600)  # run for 1 hour
+    await feed.subscribe([("uniswap_v3", "0xPoolAddress")])
 """
 
 from __future__ import annotations
@@ -113,7 +120,10 @@ class SwapEventFeed:
     ) -> None:
         self._client = client
         self._on_price_update = on_price_update
-        self._dex_name_map: Dict[str, str] = dex_name_map or {}
+        # Normalise all keys to lower-case so lookups via pool_address.lower() always hit
+        self._dex_name_map: Dict[str, str] = (
+            {k.lower(): v for k, v in dex_name_map.items()} if dex_name_map else {}
+        )
         self._token_meta: Dict[str, tuple] = {}   # address → (decimals, symbol)
         self._pool_meta: Dict[str, dict] = {}     # pool → {token0, token1, fee}
         self._subscriptions: Set[str] = set()

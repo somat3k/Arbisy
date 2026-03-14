@@ -23,7 +23,9 @@ import asyncio
 import logging
 import os
 import sys
+import tempfile
 import time
+from typing import Any
 
 # Ensure the project root is on sys.path when run directly
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -37,6 +39,31 @@ from src.utils.db import ExecutionDB
 from src.utils.logger import get_logger
 
 log = get_logger("retrain")
+
+
+def _atomic_save(obj: Any, dest_path: str) -> None:
+    """
+    Save ``obj`` to ``dest_path`` atomically.
+
+    Writes to a temporary file in the same directory, then calls
+    ``os.replace()`` to swap it into place.  This ensures that
+    ``dest_path`` either holds the old model or the new model —
+    never a partially-written file — even if the process is
+    interrupted mid-write.
+    """
+    dir_name = os.path.dirname(dest_path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        os.close(fd)
+        obj.save(tmp_path)
+        os.replace(tmp_path, dest_path)
+    except Exception:
+        # Clean up the temp file on failure; re-raise to caller
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _parse_args() -> argparse.Namespace:
@@ -108,7 +135,7 @@ async def _run(args: argparse.Namespace) -> None:
     log.info("Training GBR EnsembleModel → %s", gbr_path)
     ensemble = EnsembleModel(model_path=gbr_path)
     metrics = ensemble.fit(X, y, validate=True)
-    ensemble.save(gbr_path)
+    _atomic_save(ensemble, gbr_path)
     log.info(
         "GBR done — train_rmse=%.4f  val_rmse=%.4f  R²=%.4f",
         metrics.get("train_rmse", 0),
@@ -120,7 +147,7 @@ async def _run(args: argparse.Namespace) -> None:
     log.info("Training NeuralArbModel → %s", nn_path)
     nn = NeuralArbModel(model_path=nn_path)
     nn_metrics = nn.fit(X, y, validate=True)
-    nn.save(nn_path)
+    _atomic_save(nn, nn_path)
     log.info(
         "NN done  — train_rmse=%.4f  val_rmse=%.4f",
         nn_metrics.get("train_rmse", 0),

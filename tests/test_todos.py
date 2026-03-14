@@ -603,3 +603,223 @@ class TestBalancerArbitrage:
             mock_cfg.return_value = cfg
             arb = BalancerArbitrage(client)
         assert arb.get_loaded_pool_ids() == []
+
+
+# ── Review fixes ──────────────────────────────────────────────────────────────
+
+class TestReviewFixes:
+    """Tests that directly validate the issues addressed in the PR review."""
+
+    # ── import set_running (main.py fix) ─────────────────────────────────────
+
+    def test_set_running_importable_from_dashboard(self) -> None:
+        from src.utils.dashboard import set_running
+        assert callable(set_running)
+
+    def test_set_running_updates_status(self) -> None:
+        import src.utils.dashboard as dash
+        dash._system_status["running"] = False
+        dash._system_status["started_at"] = None
+        from src.utils.dashboard import set_running
+        set_running(True)
+        assert dash._system_status["running"] is True
+        assert dash._system_status["started_at"] is not None
+
+    # ── Valid zero address in router_address sentinel ─────────────────────────
+
+    def test_matrix_hop_list_router_address_valid(self) -> None:
+        """router_address in build_hop_list must be Web3-checksum-compatible."""
+        from web3 import Web3
+        from src.arbitrage.matrix import ArbitrageMatrix
+        from src.blockchain.dex_price_feed import PoolPrice
+        from src.arbitrage.matrix import MatrixArbPath
+
+        prices = [
+            PoolPrice(dex_name="uni", pool_address="0x" + "ab" * 20,
+                      token0="0x" + "aa" * 20, token1="0x" + "bb" * 20,
+                      token0_symbol="A", token1_symbol="B",
+                      price_token1_per_token0=1.01, price_token0_per_token1=0.99,
+                      sqrt_price_x96=0, tick=0, liquidity=1_000_000,
+                      fee_bps=30, block_number=1),
+            PoolPrice(dex_name="quick", pool_address="0x" + "cd" * 20,
+                      token0="0x" + "bb" * 20, token1="0x" + "aa" * 20,
+                      token0_symbol="B", token1_symbol="A",
+                      price_token1_per_token0=1.02, price_token0_per_token1=0.98,
+                      sqrt_price_x96=0, tick=0, liquidity=1_000_000,
+                      fee_bps=30, block_number=1),
+        ]
+        mat = ArbitrageMatrix()
+        mat.build_from_prices(prices)
+        if mat.token_count < 2:
+            return
+        path = MatrixArbPath(
+            token_indices=[0, 1, 0],
+            token_names=[mat.tokens[0], mat.tokens[1], mat.tokens[0]],
+            log_profit=0.01, profit_multiplier=1.01, profit_pct=1.0,
+        )
+        hops = mat.build_hop_list(path)
+        for hop in hops:
+            router = hop["router_address"]
+            # Must be convertible to a valid checksum address (40 hex chars + 0x)
+            assert len(router) == 42, f"router_address length wrong: {router}"
+            Web3.to_checksum_address(router)  # must not raise
+
+    # ── dex_name_map lowercase normalisation ──────────────────────────────────
+
+    def test_swap_feed_dex_name_map_normalised(self) -> None:
+        from src.blockchain.swap_event_feed import SwapEventFeed
+        client = MagicMock()
+        mixed_map = {"0xABCdef": "uniswap_v3", "0xDEADBEEF": "quickswap_v3"}
+        feed = SwapEventFeed(client, dex_name_map=mixed_map)
+        # All keys should be lowercase
+        for key in feed._dex_name_map:
+            assert key == key.lower(), f"Key not lowercased: {key}"
+
+    def test_swap_feed_dex_name_map_lookup_case_insensitive(self) -> None:
+        from src.blockchain.swap_event_feed import SwapEventFeed
+        client = MagicMock()
+        feed = SwapEventFeed(client, dex_name_map={"0xABCDEF": "uniswap_v3"})
+        assert feed._dex_name_map.get("0xabcdef") == "uniswap_v3"
+
+    # ── factory_scanner sorted token pair ────────────────────────────────────
+
+    def test_discover_pools_calls_getpool_with_sorted_tokens(self) -> None:
+        """getPool must be called with token0 < token1 (sorted addresses)."""
+        import asyncio
+        from src.blockchain.factory_scanner import DEXFactoryScanner
+
+        calls = []
+
+        def fake_call():
+            return "0x" + "0" * 40  # zero address → no pool
+
+        mock_factory = MagicMock()
+
+        def capture_getpool(t0, t1, fee):
+            calls.append((t0.lower(), t1.lower()))
+            return MagicMock(**{"call": fake_call})
+
+        mock_factory.functions.getPool = capture_getpool
+        client = MagicMock()
+        scanner = DEXFactoryScanner.__new__(DEXFactoryScanner)
+        scanner._client = client
+        scanner._known_pools = set()
+        scanner._factories = {"uniswap_v3": "0x" + "1" * 40}
+        scanner._get_factory = MagicMock(return_value=mock_factory)
+
+        # Supply a deliberately UNSORTED pair: higher address first
+        token_high = "0x" + "ff" * 20
+        token_low  = "0x" + "00" * 20
+        asyncio.run(
+            scanner.discover_pools(
+                token_pairs=[(token_high, token_low)],
+                fee_tiers=[3000],
+                dex_names=["uniswap_v3"],
+            )
+        )
+        # The call should have sorted them so token0 < token1
+        assert len(calls) == 1
+        t0_called, t1_called = calls[0]
+        assert t0_called < t1_called, f"Not sorted: {t0_called} < {t1_called}"
+
+    # ── Balancer weight_out == 0 guard ────────────────────────────────────────
+
+    def test_balancer_spot_price_zero_weight_out(self) -> None:
+        from src.arbitrage.balancer import BalancerPool
+        pool = BalancerPool(
+            pool_id="0x1",
+            pool_address="0x2",
+            tokens=["0xa", "0xb"],
+            balances=[1000, 2000],
+            weights=[0.5, 0.0],  # weight_out = 0
+            swap_fee=0.003,
+        )
+        # Must return 0.0, not raise ZeroDivisionError
+        assert pool.spot_price(0, 1) == 0.0
+
+    # ── ETL liquidity_depth log transform ────────────────────────────────────
+
+    def test_etl_liquidity_depth_is_log_transformed(self) -> None:
+        """liquidity_depth column should be log10-transformed in X."""
+        import asyncio
+        import numpy as np
+        from unittest.mock import AsyncMock
+        from src.ml.etl import load_training_data, _DB_TO_FEATURE_IDX
+        from src.ml.feature_engineering import FEATURE_NAMES
+        from src.utils.db import ExecutionDB
+
+        liq_idx = FEATURE_NAMES.index("liquidity_depth_log")
+
+        # Mock DB that returns 10 rows with known liquidity_depth
+        db = MagicMock(spec=ExecutionDB)
+        db.enabled = True
+        db._pool = True
+        rows = [
+            {
+                "price_spread_pct": 0.5, "gas_cost_usd": 1.0,
+                "historical_success_rate": 0.6, "slippage_estimate": 0.1,
+                "block_utilization": 50.0, "liquidity_depth": 1000.0,
+                "net_profit_usd": 5.0,
+            }
+        ] * 10
+        db.fetch_training_rows = AsyncMock(return_value=rows)
+
+        X, y = asyncio.run(load_training_data(db=db, min_rows=5))
+        expected_log = np.log10(1000.0)
+        np.testing.assert_allclose(X[:, liq_idx], expected_log, rtol=1e-5)
+
+    # ── Dashboard XSS: no innerHTML with user data ────────────────────────────
+
+    def test_dashboard_html_no_innerhtml_with_data_fields(self) -> None:
+        """The dashboard must not set innerHTML using server-supplied field values."""
+        from src.utils.dashboard import _DASHBOARD_HTML
+        # The HTML should not contain any string that injects arb_type/error_message
+        # via innerHTML assignment. The new safe code uses textContent.
+        assert "textContent" in _DASHBOARD_HTML
+        # The old pattern was tr.innerHTML = "<td>" + ts + ... — must be gone
+        assert 'tr.innerHTML = "<td>"' not in _DASHBOARD_HTML
+
+    # ── Atomic model save in retrain ─────────────────────────────────────────
+
+    def test_atomic_save_writes_file(self) -> None:
+        """_atomic_save must write the model to dest_path atomically."""
+        import os, tempfile
+        from scripts.retrain import _atomic_save
+
+        class FakeModel:
+            saved_to = None
+            def save(self, path: str) -> None:
+                # Write a small marker so the file is non-empty
+                import joblib
+                joblib.dump({"ok": True}, path)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = os.path.join(tmpdir, "model.joblib")
+            _atomic_save(FakeModel(), dest)
+            assert os.path.exists(dest)
+            import joblib
+            data = joblib.load(dest)
+            assert data == {"ok": True}
+
+    def test_atomic_save_no_partial_on_failure(self) -> None:
+        """If save() raises, the dest_path must remain unchanged."""
+        import os, tempfile
+        from scripts.retrain import _atomic_save
+
+        class BrokenModel:
+            def save(self, path: str) -> None:
+                # Write partial data then raise
+                with open(path, "w") as f:
+                    f.write("partial")
+                raise RuntimeError("disk full")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = os.path.join(tmpdir, "model.joblib")
+            # Create original
+            with open(dest, "w") as f:
+                f.write("original")
+            with pytest.raises(RuntimeError):
+                _atomic_save(BrokenModel(), dest)
+            # Destination must still have the original content
+            with open(dest) as f:
+                assert f.read() == "original"

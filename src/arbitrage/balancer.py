@@ -113,7 +113,9 @@ class BalancerPool:
             token_in_idx < 0 or token_in_idx >= len(self.tokens)
             or token_out_idx < 0 or token_out_idx >= len(self.tokens)
             or self.balances[token_in_idx] == 0
+            or self.balances[token_out_idx] == 0
             or self.weights[token_in_idx] == 0
+            or self.weights[token_out_idx] == 0
         ):
             return 0.0
 

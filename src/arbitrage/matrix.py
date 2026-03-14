@@ -335,9 +335,10 @@ class ArbitrageMatrix:
                 "token_in":             token_in,
                 "token_out":            token_out,
                 "dex_name":             dex_name,
-                # "0x0" is a sentinel meaning "resolve router from dex_name at execution time".
-                # ExecutionAgent / ArbitrageAgent replaces this with the real router address.
-                "router_address":       "0x0",
+                # All-zeros address is a sentinel meaning "resolve router from
+                # dex_name at execution time". ArbitrageAgent replaces it with
+                # the real router address before the hop is executed.
+                "router_address":       "0x" + "0" * 40,
                 "fee_bps":              30,      # default 0.30%; overridden by DEX-specific logic
                 "is_v3":                True,
                 "estimated_amount_out": 0.0,     # no per-hop estimate available from matrix
