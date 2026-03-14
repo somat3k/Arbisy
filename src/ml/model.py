@@ -1,0 +1,366 @@
+"""
+sklearn-based arbitrage opportunity scoring model.
+
+Uses GradientBoostingRegressor to predict net profit (USD) from feature
+vectors.  Falls back to a simple heuristic when no trained model is
+available.
+
+No torch, tensorflow, onnx, or onnxruntime dependencies.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
+import joblib
+import numpy as np
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+
+from src.ml.feature_engineering import FEATURE_NAMES, N_FEATURES
+from src.utils.config import get_config
+from src.utils.logger import get_logger
+
+log = get_logger(__name__)
+
+# Sigmoid parameters for ArbitrageModel.predict_score() and EnsembleModel.predict_score().
+# Centre is the minimum profit threshold ($5) so ~0.5 score at break-even.
+# Scale controls how steeply the score rises above/below the centre.
+_PROFIT_SIGMOID_CENTER: float = 5.0   # USD — aligns with min_profit_usd threshold
+_PROFIT_SIGMOID_SCALE:  float = 10.0  # USD — spans ±$10 across [~0.27, ~0.73]
+
+DEFAULT_MODEL_PARAMS: Dict[str, Any] = {
+    "n_estimators":    200,
+    "max_depth":       4,
+    "learning_rate":   0.05,
+    "subsample":       0.8,
+    "min_samples_split": 5,
+    "loss":            "squared_error",
+    "random_state":    42,
+}
+
+
+class ArbitrageModel:
+    """
+    Trained GBR model that scores arbitrage opportunities.
+
+    Attributes
+    ----------
+    model:   The underlying sklearn estimator.
+    scaler:  StandardScaler fitted on training data.
+    trained: Whether the model has been fitted.
+    """
+
+    def __init__(self, model_path: Optional[str] = None) -> None:
+        cfg = get_config()
+        self._model_path = model_path or cfg.model_path
+        self.model: GradientBoostingRegressor = GradientBoostingRegressor(
+            **DEFAULT_MODEL_PARAMS
+        )
+        self.scaler: StandardScaler = StandardScaler()
+        self.trained: bool = False
+        self._load_if_exists()
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def _load_if_exists(self) -> None:
+        if os.path.exists(self._model_path):
+            try:
+                payload = joblib.load(self._model_path)
+                self.model   = payload["model"]
+                self.scaler  = payload["scaler"]
+                self.trained = True
+                log.info("ArbitrageModel loaded from %s", self._model_path)
+            except Exception as exc:
+                log.warning("Failed to load model from %s: %s", self._model_path, exc)
+
+    def reload(self) -> None:
+        """Reload the persisted model from disk, replacing the current weights."""
+        self._load_if_exists()
+
+    def save(self, path: Optional[str] = None) -> str:
+        """Persist model + scaler to disk; return the saved path."""
+        save_path = path or self._model_path
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        joblib.dump({"model": self.model, "scaler": self.scaler}, save_path)
+        log.info("ArbitrageModel saved to %s", save_path)
+        return save_path
+
+    # ── Training ──────────────────────────────────────────────────────────────
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        validate: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Train the model on feature matrix X and target vector y.
+
+        Parameters
+        ----------
+        X:        Shape (n_samples, N_FEATURES).
+        y:        Net profit in USD for each sample.
+        validate: If True, hold out 20% for validation metrics.
+
+        Returns
+        -------
+        Dict with train_rmse, val_rmse (if validate), r2.
+        """
+        from sklearn.metrics import mean_squared_error, r2_score
+        from sklearn.model_selection import train_test_split
+
+        assert X.shape[1] == N_FEATURES, f"Expected {N_FEATURES} features, got {X.shape[1]}"
+
+        metrics: Dict[str, float] = {}
+
+        if validate and len(X) >= 10:
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X, y, test_size=0.2, random_state=42
+            )
+        else:
+            X_tr, X_val, y_tr, y_val = X, None, y, None
+
+        X_tr_scaled = self.scaler.fit_transform(X_tr)
+        self.model.fit(X_tr_scaled, y_tr)
+        self.trained = True
+
+        y_pred_tr = self.model.predict(X_tr_scaled)
+        metrics["train_rmse"] = float(np.sqrt(mean_squared_error(y_tr, y_pred_tr)))
+        metrics["train_r2"]   = float(r2_score(y_tr, y_pred_tr))
+
+        if X_val is not None:
+            X_val_scaled = self.scaler.transform(X_val)
+            y_pred_val   = self.model.predict(X_val_scaled)
+            metrics["val_rmse"] = float(np.sqrt(mean_squared_error(y_val, y_pred_val)))
+            metrics["val_r2"]   = float(r2_score(y_val, y_pred_val))
+
+        log.info("Model trained — %s", metrics)
+        return metrics
+
+    # ── Inference ─────────────────────────────────────────────────────────────
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Predict net profit (USD) for each sample.
+
+        Parameters
+        ----------
+        X: Shape (n_samples, N_FEATURES) or (N_FEATURES,).
+
+        Returns
+        -------
+        Predicted net profits, shape (n_samples,).
+        """
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        assert X.shape[1] == N_FEATURES
+
+        if not self.trained:
+            return self._heuristic_predict(X)
+
+        X_scaled = self.scaler.transform(X)
+        return self.model.predict(X_scaled)
+
+    def predict_score(self, X: np.ndarray) -> float:
+        """
+        Return a 0-1 score for a single sample (normalised sigmoid of predicted profit).
+        """
+        profit = float(self.predict(X.reshape(1, -1))[0])
+        # Sigmoid centred at $5 profit, scale 10
+        import math
+        score = 1.0 / (1.0 + math.exp(-(profit - _PROFIT_SIGMOID_CENTER) / _PROFIT_SIGMOID_SCALE))
+        return round(score, 4)
+
+    @staticmethod
+    def _heuristic_predict(X: np.ndarray) -> np.ndarray:
+        """
+        Simple heuristic when no trained model is available.
+        Uses the price-spread and gas-cost features directly.
+        """
+        spread_col = FEATURE_NAMES.index("price_spread_pct")
+        gas_col    = FEATURE_NAMES.index("gas_cost_usd")
+        loan_col   = FEATURE_NAMES.index("loan_amount_usd_log")
+
+        spread   = X[:, spread_col]
+        gas      = X[:, gas_col]
+        loan_log = X[:, loan_col]
+        loan_usd = 10.0 ** loan_log
+
+        profit = loan_usd * (spread / 100.0) - gas - (loan_usd * 0.0005)
+        return profit
+
+    def feature_importances(self) -> Dict[str, float]:
+        """Return feature importances if the model is trained."""
+        if not self.trained:
+            return {}
+        imp = self.model.feature_importances_
+        return {name: round(float(v), 6) for name, v in zip(FEATURE_NAMES, imp)}
+
+
+# ── E3-S6: RandomForestRegressor ensemble ─────────────────────────────────────
+
+DEFAULT_RF_PARAMS: Dict[str, Any] = {
+    "n_estimators": 200,
+    "max_depth":    None,
+    "min_samples_split": 5,
+    "random_state": 42,
+    "n_jobs":       -1,
+}
+
+DEFAULT_ENSEMBLE_MODEL_PATH = "models/ensemble_model.joblib"
+
+
+class EnsembleModel:
+    """
+    GBR + RandomForest ensemble for arbitrage profit prediction (E3-S6).
+
+    Averages the predictions of a ``GradientBoostingRegressor`` and a
+    ``RandomForestRegressor`` to reduce variance.  Both sub-models use the
+    same 15-element feature vector and ``StandardScaler`` normalisation.
+
+    Usage
+    -----
+    ensemble = EnsembleModel()
+    X, y    = generate_synthetic_data(2000)
+    metrics = ensemble.fit(X, y)
+    score   = ensemble.predict_score(feature_vec)
+    """
+
+    def __init__(self, model_path: Optional[str] = None) -> None:
+        self._model_path = model_path or DEFAULT_ENSEMBLE_MODEL_PATH
+        self.gbr: GradientBoostingRegressor = GradientBoostingRegressor(
+            **DEFAULT_MODEL_PARAMS
+        )
+        self.rfr: RandomForestRegressor = RandomForestRegressor(
+            **DEFAULT_RF_PARAMS
+        )
+        self.scaler: StandardScaler = StandardScaler()
+        self.trained: bool = False
+        # GBR weight in the ensemble (0.5 = equal weighting)
+        self.gbr_weight: float = 0.5
+        self._load_if_exists()
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def _load_if_exists(self) -> None:
+        if os.path.exists(self._model_path):
+            try:
+                payload = joblib.load(self._model_path)
+                self.gbr        = payload["gbr"]
+                self.rfr        = payload["rfr"]
+                self.scaler     = payload["scaler"]
+                self.gbr_weight = payload.get("gbr_weight", 0.5)
+                self.trained    = True
+                log.info("EnsembleModel loaded from %s", self._model_path)
+            except Exception as exc:
+                log.warning("Failed to load ensemble from %s: %s", self._model_path, exc)
+
+    def reload(self) -> None:
+        """Reload the persisted ensemble from disk."""
+        self._load_if_exists()
+
+    def save(self, path: Optional[str] = None) -> str:
+        """Persist both sub-models and scaler to disk; return saved path."""
+        save_path = path or self._model_path
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        joblib.dump({
+            "gbr":        self.gbr,
+            "rfr":        self.rfr,
+            "scaler":     self.scaler,
+            "gbr_weight": self.gbr_weight,
+        }, save_path)
+        log.info("EnsembleModel saved to %s", save_path)
+        return save_path
+
+    # ── Training ──────────────────────────────────────────────────────────────
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        validate: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Train both GBR and RandomForest sub-models.
+
+        Parameters
+        ----------
+        X:        Shape (n_samples, N_FEATURES).
+        y:        Net profit in USD.
+        validate: Hold out 20% for validation metrics.
+        """
+        from sklearn.metrics import mean_squared_error, r2_score
+        from sklearn.model_selection import train_test_split
+
+        assert X.shape[1] == N_FEATURES
+
+        metrics: Dict[str, float] = {}
+
+        if validate and len(X) >= 10:
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X, y, test_size=0.2, random_state=42
+            )
+        else:
+            X_tr, X_val, y_tr, y_val = X, None, y, None
+
+        X_tr_scaled = self.scaler.fit_transform(X_tr)
+        self.gbr.fit(X_tr_scaled, y_tr)
+        self.rfr.fit(X_tr_scaled, y_tr)
+        self.trained = True
+
+        y_pred_tr = self._blend(X_tr_scaled)
+        metrics["train_rmse"] = float(np.sqrt(mean_squared_error(y_tr, y_pred_tr)))
+        metrics["train_r2"]   = float(r2_score(y_tr, y_pred_tr))
+
+        if X_val is not None:
+            X_val_scaled = self.scaler.transform(X_val)
+            y_pred_val   = self._blend(X_val_scaled)
+            metrics["val_rmse"] = float(np.sqrt(mean_squared_error(y_val, y_pred_val)))
+            metrics["val_r2"]   = float(r2_score(y_val, y_pred_val))
+
+        log.info("EnsembleModel trained — %s", metrics)
+        return metrics
+
+    # ── Inference ─────────────────────────────────────────────────────────────
+
+    def _blend(self, X_scaled: np.ndarray) -> np.ndarray:
+        """Weighted average of GBR and RF predictions."""
+        gbr_pred = self.gbr.predict(X_scaled)
+        rfr_pred = self.rfr.predict(X_scaled)
+        return self.gbr_weight * gbr_pred + (1.0 - self.gbr_weight) * rfr_pred
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict net profit (USD) for each sample."""
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        assert X.shape[1] == N_FEATURES
+
+        if not self.trained:
+            return ArbitrageModel._heuristic_predict(X)
+
+        X_scaled = self.scaler.transform(X)
+        return self._blend(X_scaled)
+
+    def predict_score(self, X: np.ndarray) -> float:
+        """Return a 0–1 score (sigmoid of predicted profit) for a single sample.
+
+        The sigmoid is centred on PROFIT_SIGMOID_CENTER ($5 — the minimum
+        profit threshold) so that expected profits around $5 map to ~0.5,
+        and is scaled by PROFIT_SIGMOID_SCALE so the curve spans the
+        relevant dollar range gracefully.
+        """
+        profit = float(self.predict(X.reshape(1, -1))[0])
+        score  = 1.0 / (1.0 + math.exp(-(profit - _PROFIT_SIGMOID_CENTER) / _PROFIT_SIGMOID_SCALE))
+        return round(score, 4)
+
+    def feature_importances(self) -> Dict[str, float]:
+        """Return blended feature importances (weighted average of GBR + RF)."""
+        if not self.trained:
+            return {}
+        gbr_imp = np.array(self.gbr.feature_importances_)
+        rfr_imp = np.array(self.rfr.feature_importances_)
+        blended = self.gbr_weight * gbr_imp + (1.0 - self.gbr_weight) * rfr_imp
+        return {name: round(float(v), 6) for name, v in zip(FEATURE_NAMES, blended)}
