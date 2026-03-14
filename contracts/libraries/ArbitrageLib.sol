@@ -72,4 +72,33 @@ library ArbitrageLib {
             (address[], address[], uint24[], bool[])
         );
     }
+
+    /**
+     * @notice Decode a swap path that includes a replay-protection nonce and
+     *         per-hop expected output amounts for slippage protection (E7-S2, E7-S5).
+     *
+     * Encoding:
+     *   abi.encode(bytes32 nonce, address[] dexRouters, address[] tokens,
+     *              uint24[] fees, bool[] isV3, uint256[] expectedAmountsOut)
+     *
+     * expectedAmountsOut[hop] is the off-chain simulated output for that hop
+     * (in tokenOut units).  A zero entry means no minimum is enforced for that hop.
+     */
+    function decodeSwapPathWithNonce(bytes calldata params)
+        internal
+        pure
+        returns (
+            bytes32   nonce,
+            address[] memory dexRouters,
+            address[] memory tokens,
+            uint24[]  memory fees,
+            bool[]    memory isV3,
+            uint256[] memory expectedAmountsOut
+        )
+    {
+        (nonce, dexRouters, tokens, fees, isV3, expectedAmountsOut) = abi.decode(
+            params,
+            (bytes32, address[], address[], uint24[], bool[], uint256[])
+        );
+    }
 }

@@ -103,19 +103,28 @@ class PolygonClient:
     async def get_max_fee_params(self) -> Dict[str, Wei]:
         """
         Return EIP-1559 fee parameters suitable for a TxParams dict.
+        Caps maxFeePerGas at MAX_GAS_PRICE_GWEI to enforce the execution rule.
         Falls back to legacy gasPrice if baseFee is unavailable.
         """
+        cfg = get_config()
+        max_gas_wei = Web3.to_wei(cfg.max_gas_price_gwei, "gwei")
         try:
             latest = await self.w3.eth.get_block("latest")
             base_fee: int = latest.get("baseFeePerGas", 0)  # type: ignore[assignment]
-            max_priority = Web3.to_wei(30, "gwei")
+            max_priority = int(Web3.to_wei(30, "gwei"))
             max_fee = base_fee * 2 + max_priority
+            # Enforce the configured gas cap (E4-S1)
+            max_fee = min(max_fee, int(max_gas_wei))
+            # EIP-1559 requires maxFeePerGas >= baseFeePerGas + maxPriorityFeePerGas.
+            # After capping, ensure max_priority doesn't exceed what max_fee can cover.
+            max_priority = min(max_priority, max(0, max_fee - base_fee))
             return {
                 "maxFeePerGas":         Wei(max_fee),
                 "maxPriorityFeePerGas": Wei(max_priority),
             }
         except Exception:
             gas_price = await self.w3.eth.gas_price
+            gas_price = Wei(min(int(gas_price), int(max_gas_wei)))
             return {"gasPrice": gas_price}
 
     # ── ERC-20 helpers ────────────────────────────────────────────────────────
@@ -181,3 +190,43 @@ class PolygonClient:
     async def get_nonce(self, address: str) -> int:
         checksum = Web3.to_checksum_address(address)
         return await self.w3.eth.get_transaction_count(checksum, "pending")
+
+
+class NonceManager:
+    """
+    Serialises transaction nonce allocation to prevent nonce collisions when
+    multiple coroutines submit transactions concurrently (E4-S4).
+
+    Usage
+    -----
+    nm = NonceManager(client, wallet_address)
+    async with nm.reserve() as nonce:
+        tx = build_tx(nonce=nonce, ...)
+        await client.send_transaction(tx, private_key)
+
+    The manager fetches the on-chain pending nonce on first use and then
+    increments it locally for each reservation.  On any send error the
+    cached nonce is invalidated so the next call re-fetches from the chain.
+    """
+
+    def __init__(self, client: "PolygonClient", address: str) -> None:
+        self._client  = client
+        self._address = address
+        self._nonce:  int = -1
+        self._lock    = asyncio.Lock()
+
+    async def _refresh(self) -> None:
+        self._nonce = await self._client.get_nonce(self._address)
+
+    async def next_nonce(self) -> int:
+        """Return the next nonce and increment the local counter."""
+        async with self._lock:
+            if self._nonce < 0:
+                await self._refresh()
+            nonce = self._nonce
+            self._nonce += 1
+            return nonce
+
+    def invalidate(self) -> None:
+        """Reset the cached nonce; the next call will re-fetch from chain."""
+        self._nonce = -1

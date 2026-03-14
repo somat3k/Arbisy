@@ -8,6 +8,8 @@ FlashLoanArbitrage contract, and monitors execution results.
 from __future__ import annotations
 
 import asyncio
+import os
+import secrets
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -119,14 +121,27 @@ class FlashLoan:
     # ── Encoding ──────────────────────────────────────────────────────────────
 
     @staticmethod
-    def encode_swap_path(hops: List[SwapHop]) -> bytes:
+    def encode_swap_path(
+        hops: List[SwapHop],
+        expected_amounts_out: Optional[List[int]] = None,
+    ) -> bytes:
         """
         ABI-encode a list of SwapHop objects into the bytes `params` expected
         by FlashLoanArbitrage.executeOperation.
 
-        Encoding: (address[] routers, address[] tokens, uint24[] fees, bool[] isV3)
+        Encoding (E7-S2, E7-S5):
+            (bytes32 nonce, address[] routers, address[] tokens,
+             uint24[] fees, bool[] isV3, uint256[] expectedAmountsOut)
+
+        A fresh cryptographic nonce is generated for each call to ensure
+        replay protection in the contract.
         tokens has len(hops)+1 entries (token_in of hop0 .. token_out of last hop).
+        expected_amounts_out: per-hop expected output amounts from off-chain
+            simulation (in tokenOut smallest units).  Pass None or an empty list
+            to skip per-hop slippage checks (profit guard is the backstop).
         """
+        nonce = secrets.token_bytes(32)
+
         routers = [Web3.to_checksum_address(h.router_address) for h in hops]
         tokens: List[str] = []
         fees: List[int] = []
@@ -139,9 +154,17 @@ class FlashLoan:
             fees.append(hop.fee_bps * 100)  # bps → Uniswap V3 fee units (hundredths of a bps; e.g. 30 bps → 3000)
             is_v3.append(hop.is_v3)
 
+        # Pad or truncate expected_amounts_out to match hop count
+        n_hops = len(hops)
+        amounts_out: List[int] = list(expected_amounts_out or [])
+        if len(amounts_out) < n_hops:
+            amounts_out.extend([0] * (n_hops - len(amounts_out)))
+        else:
+            amounts_out = amounts_out[:n_hops]
+
         encoded = encode(
-            ["address[]", "address[]", "uint24[]", "bool[]"],
-            [routers, tokens, fees, is_v3],
+            ["bytes32", "address[]", "address[]", "uint24[]", "bool[]", "uint256[]"],
+            [nonce, routers, tokens, fees, is_v3, amounts_out],
         )
         return encoded
 

@@ -4,6 +4,7 @@ Logging utilities.
 Provides a pre-configured logger with:
 - Colored console output (via colorlog)
 - Optional rotating file handler
+- Optional structured JSON output (via python-json-logger, E5-S3)
 - Consistent format across all modules
 """
 
@@ -19,6 +20,17 @@ try:
     _HAS_COLORLOG = True
 except ImportError:
     _HAS_COLORLOG = False
+
+try:
+    # python-json-logger 3.x uses pythonjsonlogger.json;
+    # earlier versions used pythonjsonlogger.jsonlogger — try both.
+    try:
+        from pythonjsonlogger import json as _jsonlogger
+    except ImportError:
+        from pythonjsonlogger import jsonlogger as _jsonlogger  # type: ignore[no-redef]
+    _HAS_JSON_LOGGER = True
+except ImportError:
+    _HAS_JSON_LOGGER = False
 
 _LOGGERS: dict[str, logging.Logger] = {}
 
@@ -52,12 +64,20 @@ def get_logger(
     name:     Logger name (usually ``__name__`` of the calling module).
     level:    Override log level (default: reads LOG_LEVEL env var or INFO).
     log_file: Path for a rotating file handler (default: reads LOG_FILE env var).
+
+    JSON structured logging (E5-S3)
+    --------------------------------
+    Set the environment variable ``LOG_JSON=1`` to emit every log record as a
+    single-line JSON object (suitable for Loki / CloudWatch ingestion).
+    When ``python-json-logger`` is not installed the setting is ignored and
+    plain-text output is used instead.
     """
     if name in _LOGGERS:
         return _LOGGERS[name]
 
     resolved_level = level or os.getenv("LOG_LEVEL", "INFO")
     numeric_level = getattr(logging, resolved_level.upper(), logging.INFO)
+    use_json = os.getenv("LOG_JSON", "0").strip() not in ("", "0", "false", "False")
 
     logger = logging.getLogger(name)
     logger.setLevel(numeric_level)
@@ -66,15 +86,24 @@ def get_logger(
     # Console handler
     console = logging.StreamHandler()
     console.setLevel(numeric_level)
-    if _HAS_COLORLOG:
+
+    if use_json and _HAS_JSON_LOGGER:
+        # Structured JSON output — each record is one JSON line
+        json_fmt = _jsonlogger.JsonFormatter(
+            "%(asctime)s %(name)s %(levelname)s %(message)s",
+            datefmt=DATE_FORMAT,
+        )
+        console.setFormatter(json_fmt)
+    elif _HAS_COLORLOG:
         formatter = colorlog.ColoredFormatter(
             COLOR_FORMAT,
             datefmt=DATE_FORMAT,
             log_colors=LOG_COLORS,
         )
+        console.setFormatter(formatter)
     else:
         formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
-    console.setFormatter(formatter)
+        console.setFormatter(formatter)
     logger.addHandler(console)
 
     # File handler (optional)
@@ -85,7 +114,13 @@ def get_logger(
             file_path, maxBytes=10 * 1024 * 1024, backupCount=5
         )
         fh.setLevel(numeric_level)
-        fh.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
+        if use_json and _HAS_JSON_LOGGER:
+            fh.setFormatter(_jsonlogger.JsonFormatter(
+                "%(asctime)s %(name)s %(levelname)s %(message)s",
+                datefmt=DATE_FORMAT,
+            ))
+        else:
+            fh.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
         logger.addHandler(fh)
 
     _LOGGERS[name] = logger

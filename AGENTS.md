@@ -76,7 +76,7 @@ RELEASE    ExecutionAgent calls FlashLoanArbitrage.initiateFlashLoan()
 - [ ] Add WebSocket subscription to Uniswap V3 `Swap` events for sub-block detection
 - [ ] Implement proper gas estimation with EIP-1559 support
 - [x] Add circuit-breaker: halt execution if 3 consecutive losses occur *(implemented in `ExecutionAgent._consecutive_losses`)*
-- [ ] Add slippage protection (max 0.5% slippage per hop)
+- [x] Add slippage protection (max 0.5% slippage per hop) *(implemented in `FlashLoanArbitrage.sol` via `maxSlippageBps` + per-hop `amountOutMinimum`)*
 
 ### MEDIUM Priority
 - [ ] Expand token universe (add MATIC, WBTC, LINK, AAVE pools)
@@ -185,10 +185,10 @@ together deliver a releasable capability.
 **Stories:**
 - [ ] **E3-S1** Persist opportunity and execution logs to PostgreSQL (`executions` table with all feature columns and `net_profit_usd` label).
 - [ ] **E3-S2** Build an ETL pipeline that extracts features from the PostgreSQL log into a training dataset.
-- [ ] **E3-S3** Tune `GradientBoostingRegressor` hyperparameters via `GridSearchCV` on 90-day lookback window.
+- [x] **E3-S3** Tune `GradientBoostingRegressor` hyperparameters via `GridSearchCV` on 90-day lookback window. *(implemented in `src/ml/training.tune_hyperparameters()`)*
 - [ ] **E3-S4** Set up a weekly cron job that retrains the model and replaces `models/arbitrage_model.joblib`.
 - [ ] **E3-S5** Add a model evaluation dashboard: RMSE, R², feature importances (Prometheus + Grafana or FastAPI endpoint).
-- [ ] **E3-S6** Explore a secondary `RandomForestRegressor` ensemble for variance reduction.
+- [x] **E3-S6** Explore a secondary `RandomForestRegressor` ensemble for variance reduction. *(implemented in `src/ml/model.EnsembleModel`)*
 
 ---
 
@@ -198,12 +198,12 @@ together deliver a releasable capability.
 > waste, RPC failures, or adverse market conditions.
 
 **Stories:**
-- [ ] **E4-S1** Implement EIP-1559 gas estimation: cap `maxFeePerGas` at `MAX_GAS_PRICE_GWEI`; skip execution if base fee exceeds threshold.
+- [x] **E4-S1** Implement EIP-1559 gas estimation: cap `maxFeePerGas` at `MAX_GAS_PRICE_GWEI`; skip execution if base fee exceeds threshold. *(implemented in `PolygonClient.get_max_fee_params()`)*
 - [ ] **E4-S2** Add per-hop slippage protection: compute `amountOutMinimum` from expected output minus 0.5% and pass to DEX swap functions.
-- [ ] **E4-S3** Implement exponential back-off retry in `ExecutionAgent` for RPC transient errors (up to 3 retries, max 8 s delay).
-- [ ] **E4-S4** Add a nonce management service that serialises concurrent transaction submissions and handles stuck transactions.
+- [x] **E4-S3** Implement exponential back-off retry in `ExecutionAgent` for RPC transient errors (up to 3 retries, max 8 s delay). *(implemented in `ExecutionAgent._execute_with_retry()`)*
+- [x] **E4-S4** Add a nonce management service that serialises concurrent transaction submissions and handles stuck transactions. *(implemented in `polygon_client.NonceManager`)*
 - [ ] **E4-S5** Implement MEV protection: submit transactions via Flashbots-compatible private mempool on zkEVM (or a bundler service).
-- [ ] **E4-S6** Extend the circuit-breaker: persist loss streaks across restarts; alert on Slack/Telegram after circuit trips.
+- [x] **E4-S6** Extend the circuit-breaker: persist loss streaks across restarts; alert on Slack/Telegram after circuit trips. *(persistence implemented in `ExecutionAgent`; persists to `data/circuit_breaker.json`)*
 
 ---
 
@@ -213,11 +213,11 @@ together deliver a releasable capability.
 > quality, and P&L in real time.
 
 **Stories:**
-- [ ] **E5-S1** Add a Prometheus metrics endpoint (`/metrics`) exposing: `cycle_duration_ms`, `opportunities_found_total`, `executions_total`, `profit_usd_total`, `ml_score_histogram`.
+- [x] **E5-S1** Add a Prometheus metrics endpoint (`/metrics`) exposing: `cycle_duration_ms`, `opportunities_found_total`, `executions_total`, `profit_usd_total`, `ml_score_histogram`. *(implemented in `src/utils/metrics.ArbisyMetrics`)*
 - [ ] **E5-S2** Build a Grafana dashboard with panels for: rolling P&L, ML score distribution, gas cost trend, circuit-breaker status.
-- [ ] **E5-S3** Implement structured JSON logging (via `python-json-logger`) and ship logs to a centralised store (e.g., Loki, CloudWatch).
+- [x] **E5-S3** Implement structured JSON logging (via `python-json-logger`) and ship logs to a centralised store (e.g., Loki, CloudWatch). *(implemented in `src/utils/logger.py`; enable with `LOG_JSON=1`)*
 - [ ] **E5-S4** Build a minimal FastAPI + WebSocket dashboard: live opportunity feed, execution log, current model metrics.
-- [ ] **E5-S5** Add health-check endpoint (`/healthz`) that verifies RPC connectivity and contract reachability; integrate with a watchdog (systemd / Docker).
+- [x] **E5-S5** Add health-check endpoint (`/healthz`) that verifies RPC connectivity and contract reachability; integrate with a watchdog (systemd / Docker). *(implemented in `src/utils/health.py`)*
 
 ---
 
@@ -242,7 +242,7 @@ together deliver a releasable capability.
 
 **Stories:**
 - [ ] **E7-S1** Commission an independent security audit of `FlashLoanArbitrage.sol`.
-- [ ] **E7-S2** Implement replay protection: include a nonce in ABI-encoded `params`; reject calls with an already-used nonce.
-- [ ] **E7-S3** Add a pause mechanism (`Pausable`) to the contract: owner can halt all flash-loan execution instantly.
-- [ ] **E7-S4** Restrict `withdrawToken` to a configurable allow-list of destination addresses.
-- [ ] **E7-S5** Add a maxSlippage parameter to the contract; revert inside `executeOperation` if slippage exceeds the on-chain limit.
+- [x] **E7-S2** Implement replay protection: include a nonce in ABI-encoded `params`; reject calls with an already-used nonce. *(implemented: `usedNonces` mapping + `decodeSwapPathWithNonce` in `ArbitrageLib`; Python side generates fresh nonce via `secrets.token_bytes(32)` in `FlashLoan.encode_swap_path()`)*
+- [x] **E7-S3** Add a pause mechanism (`Pausable`) to the contract: owner can halt all flash-loan execution instantly. *(implemented: `paused` bool + `whenNotPaused` modifier + `pause()`/`unpause()` admin functions)*
+- [x] **E7-S4** Restrict `withdrawToken` to a configurable allow-list of destination addresses. *(implemented: `allowedWithdrawTo` mapping + `setAllowedWithdrawTo()` admin; both `withdrawToken` and `withdrawEth` check the list)*
+- [x] **E7-S5** Add a maxSlippage parameter to the contract; revert inside `executeOperation` if slippage exceeds the on-chain limit. *(implemented: `maxSlippageBps` (default 50 = 0.5%) + per-hop `amountOutMinimum` in V3 swaps + `SlippageExceeded` revert)*

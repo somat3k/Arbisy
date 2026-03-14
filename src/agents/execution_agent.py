@@ -8,6 +8,8 @@ Uses LLM reasoning to make final go/no-go decisions before signing.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from typing import Any, Dict, List, Optional
 
 from src.agents.base_agent import BaseAgent, LLMProvider
@@ -31,6 +33,13 @@ log = get_logger(__name__)
 # Update this constant or replace with a live price feed for production use.
 _ETH_PRICE_USD: float = 1800.0
 
+# File where the circuit-breaker state is persisted across restarts (E4-S6)
+_CIRCUIT_STATE_FILE = "data/circuit_breaker.json"
+
+# Retry parameters for transient RPC errors (E4-S3)
+_MAX_RETRIES = 3
+_MAX_RETRY_DELAY = 8.0  # seconds
+
 
 class ExecutionAgent(BaseAgent):
     """
@@ -41,8 +50,13 @@ class ExecutionAgent(BaseAgent):
     1. Receive OpportunityPayload from the bus
     2. Run final ML score check
     3. Ask LLM for final go/no-go reasoning
-    4. If approved, call FlashLoan.execute_flash_loan()
+    4. If approved, call FlashLoan.execute_flash_loan() with exponential back-off retry
     5. Publish ExecutionResultPayload
+
+    Circuit-breaker (E4-S6)
+    -----------------------
+    Consecutive-loss count is persisted to ``data/circuit_breaker.json`` so
+    that a halted circuit breaker survives process restarts.
     """
 
     def __init__(
@@ -65,8 +79,9 @@ class ExecutionAgent(BaseAgent):
         self._min_profit_usd   = cfg.min_profit_usd
         self._max_gas_gwei     = cfg.max_gas_price_gwei
         self._ml_threshold     = cfg.ml_score_threshold
-        self._consecutive_losses = 0
         self._circuit_break_limit = 3
+        # Load persisted circuit-breaker state (E4-S6)
+        self._consecutive_losses = self._load_circuit_state()
 
     @property
     def system_prompt(self) -> str:
@@ -75,6 +90,76 @@ class ExecutionAgent(BaseAgent):
             "You make final go/no-go decisions on flash loan arbitrage trades. "
             "Respond ONLY with valid JSON containing 'execute': bool and 'reason': str."
         )
+
+    # ── Circuit-breaker persistence (E4-S6) ───────────────────────────────────
+
+    @staticmethod
+    def _load_circuit_state() -> int:
+        """Load persisted consecutive-loss count from disk."""
+        try:
+            if os.path.exists(_CIRCUIT_STATE_FILE):
+                with open(_CIRCUIT_STATE_FILE) as f:
+                    data = json.load(f)
+                    return int(data.get("consecutive_losses", 0))
+        except Exception as exc:
+            log.warning("Could not load circuit-breaker state: %s", exc)
+        return 0
+
+    def _save_circuit_state(self) -> None:
+        """Persist consecutive-loss count to disk so it survives restarts."""
+        try:
+            os.makedirs(os.path.dirname(_CIRCUIT_STATE_FILE) or ".", exist_ok=True)
+            with open(_CIRCUIT_STATE_FILE, "w") as f:
+                json.dump({"consecutive_losses": self._consecutive_losses}, f)
+        except Exception as exc:
+            log.warning("Could not persist circuit-breaker state: %s", exc)
+
+    def reset_circuit_breaker(self) -> None:
+        """Manually reset the circuit breaker (e.g. after operator review)."""
+        self._consecutive_losses = 0
+        self._save_circuit_state()
+        log.info("Circuit breaker manually reset")
+
+    # ── Retry logic (E4-S3) ───────────────────────────────────────────────────
+
+    async def _execute_with_retry(
+        self,
+        opportunity: OpportunityPayload,
+    ) -> Dict[str, Any]:
+        """
+        Execute the flash loan with exponential back-off retry on transient
+        RPC errors (up to _MAX_RETRIES attempts, max delay _MAX_RETRY_DELAY s).
+
+        Transient errors are identified both by exception type (asyncio.TimeoutError,
+        ConnectionError, OSError) at the call site and by keywords in the returned
+        error_message string.  Contract reverts and non-transient failures are not
+        retried so they fail fast without wasting gas budget.
+        """
+        # Keywords that indicate a transient RPC/network error in the error string
+        _TRANSIENT_KEYWORDS = ("timeout", "connection", "rpc", "network", "429", "503")
+
+        last_result: Dict[str, Any] = {}
+        for attempt in range(_MAX_RETRIES):
+            try:
+                last_result = await self._flash.execute_flash_loan(opportunity)
+            except (asyncio.TimeoutError, ConnectionError, OSError) as exc:
+                # Transient network/OS exception — treat as retryable
+                last_result = {"success": False, "error_message": str(exc)}
+            if last_result.get("success"):
+                return last_result
+            # If not a transient error (e.g. contract reverted), don't retry
+            err = last_result.get("error_message", "")
+            transient = any(kw in err.lower() for kw in _TRANSIENT_KEYWORDS)
+            if not transient:
+                return last_result
+            if attempt < _MAX_RETRIES - 1:
+                delay = min(2.0 ** attempt, _MAX_RETRY_DELAY)
+                log.warning(
+                    "Transient RPC error (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt + 1, _MAX_RETRIES, delay, err,
+                )
+                await asyncio.sleep(delay)
+        return last_result
 
     async def _final_llm_check(
         self,
@@ -160,9 +245,9 @@ class ExecutionAgent(BaseAgent):
             log.info("LLM rejected opportunity %s", opp_id)
             return
 
-        # ── Execute ───────────────────────────────────────────────────────
+        # ── Execute (with exponential back-off retry) ─────────────────────
         log.info("Executing flash loan for opportunity %s", opp_id)
-        result = await self._flash.execute_flash_loan(opportunity)
+        result = await self._execute_with_retry(opportunity)
 
         # ── Publish result ────────────────────────────────────────────────
         exec_result = ExecutionResultPayload(
@@ -182,10 +267,12 @@ class ExecutionAgent(BaseAgent):
         # ── Update circuit breaker and ML feedback ────────────────────────
         if result.get("success"):
             self._consecutive_losses = 0
+            self._save_circuit_state()
             self._inference.record_outcome(opportunity.arb_type, True)
             log.info("✓ Execution succeeded: tx=%s profit=$%.4f", exec_result.tx_hash[:10], exec_result.actual_profit_usd)
         else:
             self._consecutive_losses += 1
+            self._save_circuit_state()
             self._inference.record_outcome(opportunity.arb_type, False)
             log.warning("✗ Execution failed: %s (losses=%d)", exec_result.error_message, self._consecutive_losses)
 

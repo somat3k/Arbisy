@@ -190,3 +190,75 @@ def train_nn(
 if __name__ == "__main__":
     train()
     train_nn()
+
+
+# ── E3-S3: GridSearchCV hyperparameter tuning ─────────────────────────────────
+
+def tune_hyperparameters(
+    synthetic_samples: int = 2000,
+    use_real_data: bool = True,
+    cv: int = 5,
+    n_jobs: int = -1,
+) -> Dict[str, object]:
+    """
+    Find optimal ``GradientBoostingRegressor`` hyperparameters via
+    ``GridSearchCV`` on a 90-day (or synthetic) lookback window (E3-S3).
+
+    Parameters
+    ----------
+    synthetic_samples: Training set size when no real data is available.
+    use_real_data:     Whether to load real historical data from HISTORY_FILE.
+    cv:                Number of cross-validation folds.
+    n_jobs:            Parallel jobs for GridSearchCV (-1 = all CPUs).
+
+    Returns
+    -------
+    Dict with ``best_params`` and ``best_score`` (negative RMSE).
+    """
+    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.model_selection import GridSearchCV
+
+    X_real, y_real = load_history() if use_real_data else (None, None)
+    X_syn, y_syn   = generate_synthetic_data(synthetic_samples)
+
+    if X_real is not None and y_real is not None:
+        X = np.vstack([X_real, X_syn])
+        y = np.concatenate([y_real, y_syn])
+        log.info("GridSearchCV: %d real + %d synthetic samples", len(X_real), len(X_syn))
+    else:
+        X, y = X_syn, y_syn
+        log.info("GridSearchCV: %d synthetic samples", len(X_syn))
+
+    param_grid = {
+        "n_estimators":     [100, 200, 300],
+        "max_depth":        [3, 4, 5],
+        "learning_rate":    [0.03, 0.05, 0.10],
+        "subsample":        [0.7, 0.8, 1.0],
+        "min_samples_split": [5, 10],
+    }
+
+    estimator = GradientBoostingRegressor(loss="squared_error", random_state=42)
+    gs = GridSearchCV(
+        estimator,
+        param_grid,
+        scoring="neg_root_mean_squared_error",
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=1,
+        refit=True,
+    )
+
+    from sklearn.preprocessing import StandardScaler
+    X_scaled = StandardScaler().fit_transform(X)
+    gs.fit(X_scaled, y)
+
+    result = {
+        "best_params": gs.best_params_,
+        "best_score":  float(gs.best_score_),
+        "cv_results":  gs.cv_results_,
+    }
+    log.info(
+        "GridSearchCV complete — best RMSE=%.4f params=%s",
+        -result["best_score"], result["best_params"],
+    )
+    return result

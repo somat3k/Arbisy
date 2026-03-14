@@ -39,16 +39,26 @@ interface IPool {
  * @notice Executes atomic arbitrage across multiple DEXes funded by an
  *         Aave V3 flash loan on Polygon zkEVM.
  *
+ * Security hardening:
+ *   E7-S2  Replay protection — nonce embedded in params; used nonces are
+ *          permanently recorded and rejected on re-use.
+ *   E7-S3  Pause mechanism  — owner can halt all execution instantly.
+ *   E7-S4  withdrawToken allow-list — profits can only be swept to
+ *          pre-approved destination addresses.
+ *   E7-S5  maxSlippageBps   — per-swap amountOutMinimum enforced in V3 hops.
+ *
  * Execution flow:
- *   1. Owner calls initiateFlashLoan() with encoded swap path in `params`.
+ *   1. Owner calls initiateFlashLoanSimple() with encoded swap path in `params`.
  *   2. Aave Pool transfers the requested asset to this contract.
  *   3. executeOperation() callback fires:
- *      a. Decodes the swap path.
- *      b. Executes each hop (V3 exactInputSingle or V2 swapExactTokensForTokens).
- *      c. Verifies that output ≥ loan + premium (profit check).
- *      d. Approves the Pool to pull back loan + premium.
+ *      a. Checks contract is not paused (E7-S3).
+ *      b. Validates and consumes the nonce (E7-S2).
+ *      c. Decodes the swap path.
+ *      d. Executes each hop; for V3 hops amountOutMinimum is applied (E7-S5).
+ *      e. Verifies that output ≥ loan + premium (profit check).
+ *      f. Approves the Pool to pull back loan + premium.
  *   4. Pool reclaims loan + premium; net profit stays in this contract.
- *   5. Owner calls withdrawToken() to collect profits.
+ *   5. Owner calls withdrawToken() to an allow-listed address (E7-S4).
  */
 contract FlashLoanArbitrage is IFlashLoanReceiver {
     using ArbitrageLib for uint256;
@@ -65,6 +75,19 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
     // ── DEX whitelist ─────────────────────────────────────────────────────────
     mapping(address => bool) public allowedDEX;
 
+    // ── E7-S2: Replay-protection nonce registry ───────────────────────────────
+    mapping(bytes32 => bool) public usedNonces;
+
+    // ── E7-S3: Pause mechanism ────────────────────────────────────────────────
+    bool public paused;
+
+    // ── E7-S4: Withdrawal allow-list ──────────────────────────────────────────
+    mapping(address => bool) public allowedWithdrawTo;
+
+    // ── E7-S5: Max per-hop slippage ───────────────────────────────────────────
+    /// @notice Maximum allowed slippage in basis points per swap hop (default 50 = 0.5%).
+    uint256 public maxSlippageBps = 50;
+
     // ── Config ────────────────────────────────────────────────────────────────
     uint256 public maxFlashLoanAmount = 1_000_000e18; // 1M tokens default cap
 
@@ -79,6 +102,10 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
     event DEXAllowlistUpdated(address indexed dex, bool allowed);
     event MaxLoanAmountUpdated(uint256 newMax);
     event ProfitWithdrawn(address indexed token, uint256 amount, address indexed to);
+    event Paused(address by);
+    event Unpaused(address by);
+    event WithdrawAllowlistUpdated(address indexed addr, bool allowed);
+    event MaxSlippageUpdated(uint256 newMaxSlippageBps);
 
     // ── Errors ────────────────────────────────────────────────────────────────
     error OnlyOwner();
@@ -93,6 +120,11 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
     error MultiAssetNotSupported();
     error ExceedsMaxLoanAmount(uint256 requested, uint256 maximum);
     error ZeroAmount();
+    error ContractPaused();                              // E7-S3
+    error NonceAlreadyUsed(bytes32 nonce);              // E7-S2
+    error WithdrawDestinationNotAllowed(address to);    // E7-S4
+    error SlippageExceeded(uint256 amountOut, uint256 minimum); // E7-S5
+    error SlippageCapTooHigh(uint256 provided, uint256 maximum); // E7-S5
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
     modifier onlyOwner() {
@@ -105,6 +137,12 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
         _status = _ENTERED;
         _;
         _status = _NOT_ENTERED;
+    }
+
+    /// @dev E7-S3: Reverts if the contract is paused.
+    modifier whenNotPaused() {
+        if (paused) revert ContractPaused();
+        _;
     }
 
     // ── Constructor ───────────────────────────────────────────────────────────
@@ -129,7 +167,7 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
         uint256[] calldata premiums,
         address initiator,
         bytes calldata params
-    ) external override nonReentrant returns (bool) {
+    ) external override nonReentrant whenNotPaused returns (bool) {
         // Only the Aave Pool may call this function
         if (msg.sender != AAVE_POOL) revert OnlyAavePool();
         // Only operations initiated by this contract are valid
@@ -145,6 +183,7 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
 
     /**
      * @dev Core arbitrage logic for a single asset.
+     *      Includes nonce replay check (E7-S2) and per-hop slippage guard (E7-S5).
      */
     function _executeArbitrage(
         address asset,
@@ -154,18 +193,25 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
     ) internal {
         uint256 repay = loanAmount + premium;
 
-        // Decode the swap path
+        // E7-S2: Decode and consume the nonce embedded in params.
+        // Params layout: abi.encode(bytes32 nonce, address[] routers,
+        //                           address[] tokens, uint24[] fees, bool[] isV3,
+        //                           uint256[] expectedAmountsOut)
+        // expectedAmountsOut[hop] is the off-chain simulated output for that hop.
+        // A zero entry means "no minimum enforced for this hop" (profit guard is backstop).
         (
+            bytes32 nonce,
             address[] memory dexRouters,
             address[] memory tokens,
             uint24[]  memory fees,
-            bool[]    memory isV3
-        ) = ArbitrageLib.decodeSwapPath(params);
+            bool[]    memory isV3,
+            uint256[] memory expectedAmountsOut
+        ) = ArbitrageLib.decodeSwapPathWithNonce(params);
+
+        if (usedNonces[nonce]) revert NonceAlreadyUsed(nonce);
+        usedNonces[nonce] = true;
 
         // Validate path lengths and asset in/out invariant.
-        // tokens must satisfy: tokens[0] == asset (start) and
-        //                      tokens[tokens.length-1] == asset (close cycle).
-        // fees and isV3 must each have exactly dexRouters.length entries.
         if (tokens.length < 2) revert InvalidPathLength();
         if (dexRouters.length != tokens.length - 1) revert InvalidPathLength();
         if (fees.length != dexRouters.length) revert ArrayLengthMismatch();
@@ -186,10 +232,23 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
             IERC20(tokenIn).approve(router, currentAmount);
 
             if (isV3[hop]) {
-                currentAmount = _swapV3(
-                    router, tokenIn, tokenOut, fees[hop], currentAmount
+                // E7-S5: Use off-chain expected output as amountOutMinimum,
+                // reduced by maxSlippageBps. This correctly computes the minimum
+                // in tokenOut units using the simulated exchange rate.
+                // If no expected output was provided (zero), fall back to 0
+                // (the overall profit guard at the end is the backstop).
+                uint256 amountOutMin = 0;
+                if (expectedAmountsOut.length > hop && expectedAmountsOut[hop] > 0) {
+                    amountOutMin = (expectedAmountsOut[hop] * (10_000 - maxSlippageBps)) / 10_000;
+                }
+                uint256 amountOut = _swapV3(
+                    router, tokenIn, tokenOut, fees[hop], currentAmount, amountOutMin
                 );
+                if (amountOutMin > 0 && amountOut < amountOutMin)
+                    revert SlippageExceeded(amountOut, amountOutMin);
+                currentAmount = amountOut;
             } else {
+                // V2 uses amountOutMin = 0 (profit guard is the backstop)
                 currentAmount = _swapV2(
                     router, tokenIn, tokenOut, currentAmount
                 );
@@ -206,10 +265,6 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
         // Approve the Aave Pool to pull back loan + premium
         IERC20(asset).approve(AAVE_POOL, repay);
 
-        // Emit `owner` as initiator: `owner` is declared `immutable` (set once
-        // in the constructor and never changeable), so it unambiguously identifies
-        // the account that deployed and controls this contract.  Using `tx.origin`
-        // would be unsafe when called via a smart-account or relayer.
         emit ArbitrageExecuted(asset, loanAmount, repay, profit, owner);
     }
 
@@ -222,7 +277,8 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
         address tokenIn,
         address tokenOut,
         uint24  fee,
-        uint256 amountIn
+        uint256 amountIn,
+        uint256 amountOutMinimum  // E7-S5
     ) internal returns (uint256 amountOut) {
         IUniswapV3Router.ExactInputSingleParams memory swapParams =
             IUniswapV3Router.ExactInputSingleParams({
@@ -232,7 +288,7 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
                 recipient:         address(this),
                 deadline:          block.timestamp + 60,
                 amountIn:          amountIn,
-                amountOutMinimum:  0, // slippage checked via profit guard
+                amountOutMinimum:  amountOutMinimum,
                 sqrtPriceLimitX96: 0
             });
         amountOut = IUniswapV3Router(router).exactInputSingle(swapParams);
@@ -250,7 +306,7 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
 
         uint256[] memory amounts = IUniswapV2Router(router).swapExactTokensForTokens(
             amountIn,
-            0, // slippage checked via profit guard
+            0, // slippage checked via overall profit guard
             path,
             address(this),
             block.timestamp + 60
@@ -264,17 +320,13 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
 
     /**
      * @notice Initiate a multi-asset Aave V3 flash loan.
-     * @param assets             ERC-20 token addresses to borrow.
-     * @param amounts            Amounts to borrow for each asset.
-     * @param interestRateModes  0 = no open debt (standard flash loan).
-     * @param params             ABI-encoded swap path (see ArbitrageLib).
      */
     function initiateFlashLoan(
         address[] calldata assets,
         uint256[] calldata amounts,
         uint256[] calldata interestRateModes,
         bytes calldata params
-    ) external onlyOwner nonReentrant {
+    ) external onlyOwner nonReentrant whenNotPaused {
         for (uint256 i = 0; i < amounts.length; i++) {
             if (amounts[i] == 0) revert ZeroAmount();
             if (amounts[i] > maxFlashLoanAmount)
@@ -288,7 +340,7 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
             interestRateModes,
             address(this),
             params,
-            0 // referralCode
+            0
         );
     }
 
@@ -299,7 +351,7 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
         address asset,
         uint256 amount,
         bytes calldata params
-    ) external onlyOwner nonReentrant {
+    ) external onlyOwner nonReentrant whenNotPaused {
         if (amount == 0) revert ZeroAmount();
         if (amount > maxFlashLoanAmount)
             revert ExceedsMaxLoanAmount(amount, maxFlashLoanAmount);
@@ -315,10 +367,6 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
 
     /**
      * @notice Pure view simulation of expected net profit.
-     * @param loanAmount   Amount to borrow.
-     * @param outputAmount Estimated swap output (from off-chain simulation).
-     * @return profit      Expected profit after repaying loan + premium.
-     * @return profitable  True if the trade would be profitable.
      */
     function simulateProfit(
         uint256 loanAmount,
@@ -341,18 +389,47 @@ contract FlashLoanArbitrage is IFlashLoanReceiver {
         emit MaxLoanAmountUpdated(newMax);
     }
 
+    /// @notice E7-S4: Withdraw profits to an allow-listed address only.
     function withdrawToken(address token, uint256 amount, address to)
         external
         onlyOwner
         nonReentrant
     {
+        if (!allowedWithdrawTo[to]) revert WithdrawDestinationNotAllowed(to);
         IERC20(token).transfer(to, amount);
         emit ProfitWithdrawn(token, amount, to);
     }
 
     function withdrawEth(address payable to) external onlyOwner nonReentrant {
+        if (!allowedWithdrawTo[to]) revert WithdrawDestinationNotAllowed(to);
         to.transfer(address(this).balance);
+    }
+
+    /// @notice E7-S4: Add or remove an address from the withdrawal allow-list.
+    function setAllowedWithdrawTo(address addr, bool allowed) external onlyOwner {
+        allowedWithdrawTo[addr] = allowed;
+        emit WithdrawAllowlistUpdated(addr, allowed);
+    }
+
+    /// @notice E7-S3: Pause all flash-loan execution.
+    function pause() external onlyOwner {
+        paused = true;
+        emit Paused(msg.sender);
+    }
+
+    /// @notice E7-S3: Resume flash-loan execution.
+    function unpause() external onlyOwner {
+        paused = false;
+        emit Unpaused(msg.sender);
+    }
+
+    /// @notice E7-S5: Update the per-hop maximum slippage (in basis points).
+    function setMaxSlippageBps(uint256 newMaxSlippageBps) external onlyOwner {
+        if (newMaxSlippageBps > 1_000) revert SlippageCapTooHigh(newMaxSlippageBps, 1_000); // max 10%
+        maxSlippageBps = newMaxSlippageBps;
+        emit MaxSlippageUpdated(newMaxSlippageBps);
     }
 
     receive() external payable {}
 }
+
