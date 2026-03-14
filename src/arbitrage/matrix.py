@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -296,6 +296,53 @@ class ArbitrageMatrix:
         if i is None or j is None or self._rate_matrix is None:
             return 0.0
         return float(self._rate_matrix[i, j])
+
+    def get_hop_dex(self, from_idx: int, to_idx: int) -> Optional[str]:
+        """Return the DEX name used for the best rate from token[from_idx] to token[to_idx]."""
+        if self._dex_matrix is None:
+            return None
+        try:
+            return self._dex_matrix[from_idx, to_idx]
+        except Exception:
+            return None
+
+    def build_hop_list(self, path: "MatrixArbPath") -> List[Dict[str, Any]]:
+        """
+        Convert a MatrixArbPath into a list of swap-hop dicts for the
+        execution pipeline.
+
+        Each dict has keys: token_in, token_out, dex_name, router_address,
+        fee_bps, is_v3, estimated_amount_out.
+
+        Parameters
+        ----------
+        path: MatrixArbPath returned by find_opportunities().
+
+        Returns
+        -------
+        List of hop dicts, one per edge in the cycle (last returns to start).
+        """
+        hops: List[Dict[str, Any]] = []
+        indices = path.token_indices
+        for k in range(len(indices) - 1):
+            from_idx = indices[k]
+            to_idx   = indices[k + 1]
+            token_in  = self._tokens[from_idx]
+            token_out = self._tokens[to_idx]
+            dex_name  = self.get_hop_dex(from_idx, to_idx) or "unknown"
+            rate = float(self._rate_matrix[from_idx, to_idx]) if self._rate_matrix is not None else 0.0
+            hops.append({
+                "token_in":             token_in,
+                "token_out":            token_out,
+                "dex_name":             dex_name,
+                # "0x0" is a sentinel meaning "resolve router from dex_name at execution time".
+                # ExecutionAgent / ArbitrageAgent replaces this with the real router address.
+                "router_address":       "0x0",
+                "fee_bps":              30,      # default 0.30%; overridden by DEX-specific logic
+                "is_v3":                True,
+                "estimated_amount_out": 0.0,     # no per-hop estimate available from matrix
+            })
+        return hops
 
     @property
     def token_count(self) -> int:

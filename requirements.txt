@@ -24,6 +24,10 @@ prometheus-client>=0.20.0
 python-json-logger>=2.0.7
 fastapi>=0.111.0
 uvicorn>=0.30.1
+httpx>=0.27.0  # TestClient dependency for FastAPI
+
+# Database (E3-S1: PostgreSQL persistence) — optional
+asyncpg>=0.29.0
 
 # Testing
 pytest>=8.2.0

@@ -29,8 +29,10 @@ from src.arbitrage.cross_platform import CrossPlatformArbitrage
 from src.arbitrage.matrix import ArbitrageMatrix
 from src.arbitrage.triangular import TriangularArbitrage
 from src.blockchain.dex_price_feed import DEXPriceFeed, PoolPrice
+from src.blockchain.factory_scanner import DEXFactoryScanner
 from src.blockchain.flash_loan import FlashLoan
 from src.blockchain.polygon_client import PolygonClient
+from src.blockchain.swap_event_feed import SwapEventFeed
 from src.ml.inference import LiveInference
 from src.ml.neural_model import NeuralArbModel
 from src.ml.training import train as train_model, train_nn as train_nn_model
@@ -43,6 +45,8 @@ from src.payload.protocol import (
     SystemEventPayload,
 )
 from src.utils.config import get_config
+from src.utils.dashboard import dashboard_manager, record_execution, record_opportunity
+from src.utils.db import ExecutionDB, get_db
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -75,12 +79,20 @@ class ArbisyOrchestrator:
         self._client    = PolygonClient()
         self._price_feed = DEXPriceFeed(self._client)
         self._flash     = FlashLoan(self._client)
+        self._db        = get_db()
 
         # Detectors
         self._tri_arb     = TriangularArbitrage(max_path_length=4)
         self._cross_arb   = CrossPlatformArbitrage()
         self._matrix      = ArbitrageMatrix()
         self._array_builder = ArrayBuilder(max_hops=4, min_profit_pct=0.05)
+
+        # Pool discovery components (E2-S2, E2-S3)
+        self._swap_feed      = SwapEventFeed(
+            self._client,
+            on_price_update=self._on_swap_price_update,
+        )
+        self._factory_scanner = DEXFactoryScanner(self._client)
 
         # ML: GBR model + Neural network model
         self._inference = LiveInference()
@@ -99,11 +111,57 @@ class ArbisyOrchestrator:
             bus=self._bus,
         )
 
-        # Wire subscriptions
+        # Wire subscriptions — also hook into dashboard (E5-S4)
         self._bus.subscribe(MessageType.OPPORTUNITY,      self._exec_agent.process)
+        self._bus.subscribe(MessageType.OPPORTUNITY,      self._on_opportunity_for_dashboard)
         self._bus.subscribe(MessageType.EXECUTION_RESULT, self._anal_agent.on_execution_result)
+        self._bus.subscribe(MessageType.EXECUTION_RESULT, self._on_execution_for_dashboard)
+        self._bus.subscribe(MessageType.EXECUTION_RESULT, self._on_execution_for_db)
 
     # ── Startup ───────────────────────────────────────────────────────────────
+
+    async def _on_swap_price_update(self, pool_price: "PoolPrice") -> None:
+        """Callback from SwapEventFeed — ingest a real-time price update."""
+        self._tri_arb.update_prices([pool_price])
+        self._cross_arb.update_prices([pool_price])
+        self._matrix.build_from_prices(list(self._price_feed.get_cached_prices().values()) + [pool_price])
+        log.debug(
+            "Swap price update: %s/%s = %.6f on %s",
+            pool_price.token0_symbol,
+            pool_price.token1_symbol,
+            pool_price.price_token1_per_token0,
+            pool_price.dex_name,
+        )
+
+    async def _on_opportunity_for_dashboard(self, payload: "OpportunityPayload") -> None:
+        """Forward opportunities to the live dashboard (E5-S4)."""
+        record_opportunity(payload.to_dict())
+
+    async def _on_execution_for_dashboard(self, payload: "ExecutionResultPayload") -> None:
+        """Forward execution results to the live dashboard (E5-S4)."""
+        record_execution(payload.to_dict())
+
+    async def _on_execution_for_db(self, payload: "ExecutionResultPayload") -> None:
+        """Persist execution result to PostgreSQL (E3-S1)."""
+        if not self._db.enabled:
+            return
+        # Retrieve the matching opportunity details from the analysis agent if available,
+        # otherwise use sensible defaults.
+        await self._db.log_execution(
+            arb_type="unknown",
+            price_spread_pct=0.0,
+            gas_cost_usd=payload.gas_price_gwei * 150_000 * 1e-9 * 1800,
+            liquidity_depth=0.0,
+            historical_success_rate=0.0,
+            slippage_estimate=0.0,
+            block_utilization=50.0,
+            time_since_last_trade=0.0,
+            ml_score=0.0,
+            executed=True,
+            success=payload.success,
+            net_profit_usd=payload.actual_profit_usd if payload.success else 0.0,
+            tx_hash=payload.tx_hash,
+        )
 
     async def _ensure_model(self) -> None:
         """Train models if no persisted versions exist."""
@@ -217,18 +275,24 @@ class ArbisyOrchestrator:
                 "gas_estimate_gwei":     0.0,
             })
 
-        # Matrix arbitrage
+        # Matrix arbitrage — build proper hops via build_hop_list() (E6-S1)
         matrix_opps = self._matrix.find_opportunities(min_profit_pct=0.05)
         for opp in matrix_opps:
+            # Reconstruct actual swap hops from the matrix path (E6-S1)
+            matrix_hops = self._matrix.build_hop_list(opp)
+            n_hops = len(matrix_hops)
+            # Scale slippage estimate with number of hops (multi-hop = more risk)
+            slip_pct = max(0.1, n_hops * 0.05)
+            dex_sources = list({h["dex_name"] for h in matrix_hops if h["dex_name"] != "unknown"}) or ["matrix"]
             candidates.append({
                 "arb_type":              "matrix",
                 "estimated_profit_pct":  opp.profit_pct,
                 "asset":                 opp.token_names[0] if opp.token_names else "0x0",
                 "loan_amount_usd":       10_000.0,
                 "loan_amount_wei":       10_000 * 10**6,
-                "dex_sources":           ["matrix"],
-                "hops":                  [],
-                "slippage_estimate_pct": 0.15,
+                "dex_sources":           dex_sources,
+                "hops":                  matrix_hops,
+                "slippage_estimate_pct": slip_pct,
                 "gas_estimate_gwei":     0.0,
             })
 
@@ -353,11 +417,28 @@ class ArbisyOrchestrator:
         await self._verify_connection()
         await self._ensure_model()
 
+        # Connect to PostgreSQL if configured (E3-S1)
+        await self._db.connect()
+
         self._running = True
+        set_running(True)
 
         # Start background tasks
-        bus_task     = asyncio.create_task(self._bus.run(), name="bus")
-        anal_task    = asyncio.create_task(self._anal_agent.process(), name="analysis")
+        bus_task       = asyncio.create_task(self._bus.run(), name="bus")
+        anal_task      = asyncio.create_task(self._anal_agent.process(), name="analysis")
+
+        # Start live dashboard server (E5-S4)
+        await dashboard_manager.start(port=8080)
+
+        # Start WebSocket swap-event feed if pool configs are available (E2-S2)
+        pool_configs = self._price_feed.pool_configs
+        swap_feed_task: Optional[asyncio.Task] = None
+        if pool_configs:
+            swap_feed_task = asyncio.create_task(
+                self._swap_feed.subscribe(pool_configs),
+                name="swap_event_feed",
+            )
+            log.info("SwapEventFeed started for %d pools", len(pool_configs))
 
         log.info("Entering Find → Simulate → Release loop (interval=%.1fs)", self._cfg.poll_interval_seconds)
 
@@ -372,9 +453,15 @@ class ArbisyOrchestrator:
             pass
         finally:
             self._running = False
+            set_running(False)
+            self._swap_feed.stop()
+            if swap_feed_task:
+                swap_feed_task.cancel()
             self._bus.stop()
             bus_task.cancel()
             anal_task.cancel()
+            dashboard_manager.stop()
+            await self._db.close()
             await self._arb_agent.close()
             await self._exec_agent.close()
             await self._anal_agent.close()

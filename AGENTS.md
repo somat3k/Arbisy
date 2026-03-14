@@ -73,22 +73,23 @@ RELEASE    ExecutionAgent calls FlashLoanArbitrage.initiateFlashLoan()
 - [ ] Deploy `FlashLoanArbitrage.sol` to Polygon zkEVM mainnet
 - [ ] Configure live RPC endpoints and private key in `.env`
 - [ ] Seed `MLModel` with real historical trade data and retrain
-- [ ] Add WebSocket subscription to Uniswap V3 `Swap` events for sub-block detection
-- [ ] Implement proper gas estimation with EIP-1559 support
+- [x] Add WebSocket subscription to Uniswap V3 `Swap` events for sub-block detection *(implemented in `src/blockchain/swap_event_feed.SwapEventFeed`; E2-S2)*
+- [x] Implement proper gas estimation with EIP-1559 support *(implemented in `PolygonClient.get_max_fee_params()`; E4-S1)*
 - [x] Add circuit-breaker: halt execution if 3 consecutive losses occur *(implemented in `ExecutionAgent._consecutive_losses`)*
 - [x] Add slippage protection (max 0.5% slippage per hop) *(implemented in `FlashLoanArbitrage.sol` via `maxSlippageBps` + per-hop `amountOutMinimum`)*
 
 ### MEDIUM Priority
 - [ ] Expand token universe (add MATIC, WBTC, LINK, AAVE pools)
+- [x] **Expand token universe** — WMATIC, WBTC, LINK, AAVE, DAI, USDT addresses added to `Config` *(E2-S4)*
 - [ ] Add SushiSwap V3 pool ABI and price-feed integration
 - [ ] Tune `GradientBoostingRegressor` hyperparameters via GridSearchCV
-- [ ] Persist opportunity and execution logs to PostgreSQL
+- [x] **Persist opportunity and execution logs to PostgreSQL** *(implemented in `src/utils/db.ExecutionDB`; E3-S1)*
 - [ ] Add Prometheus metrics endpoint for monitoring
-- [ ] Implement multi-hop arbitrage (4+ legs) via matrix solver
+- [x] **Implement multi-hop arbitrage (4+ legs) via matrix solver** *(hops now wired through execution pipeline via `ArbitrageMatrix.build_hop_list()`; E6-S1)*
 
 ### LOW Priority
-- [ ] Build a simple dashboard (FastAPI + WebSocket) for live monitoring
-- [ ] Add support for Balancer V2 pools
+- [x] **Build a simple dashboard (FastAPI + WebSocket) for live monitoring** *(implemented in `src/utils/dashboard.py`; E5-S4)*
+- [x] **Add support for Balancer V2 pools** *(implemented in `src/arbitrage/balancer.BalancerArbitrage`; E6-S2)*
 - [ ] Explore reinforcement-learning upgrade for the ML model
 - [ ] Write Hardhat/Foundry integration tests for the Solidity contract
 
@@ -170,9 +171,9 @@ together deliver a releasable capability.
 
 **Stories:**
 - [ ] **E2-S1** Populate `POOL_CONFIGS` with verified QuickSwap V3, Uniswap V3, and SushiSwap pool addresses on Polygon zkEVM mainnet.
-- [ ] **E2-S2** Implement WebSocket subscription to Uniswap V3 `Swap` events via `AsyncWeb3` for sub-block opportunity detection.
-- [ ] **E2-S3** Add a `DEXFactory` scanner that auto-discovers new pools for configured token pairs using the V3 `PoolCreated` event.
-- [ ] **E2-S4** Expand the token universe: MATIC, WBTC, LINK, AAVE, DAI, USDT pools.
+- [x] **E2-S2** Implement WebSocket subscription to Uniswap V3 `Swap` events via `AsyncWeb3` for sub-block opportunity detection. *(implemented in `src/blockchain/swap_event_feed.SwapEventFeed`; polls `eth_getLogs` per pool with configurable interval)*
+- [x] **E2-S3** Add a `DEXFactory` scanner that auto-discovers new pools for configured token pairs using the V3 `PoolCreated` event. *(implemented in `src/blockchain/factory_scanner.DEXFactoryScanner`)*
+- [x] **E2-S4** Expand the token universe: MATIC, WBTC, LINK, AAVE, DAI, USDT pools. *(token addresses added to `Config`; env vars `TOKEN_WMATIC`, `TOKEN_WBTC`, `TOKEN_LINK`, `TOKEN_AAVE`, `TOKEN_DAI`, `TOKEN_USDT`)*
 - [ ] **E2-S5** Add SushiSwap V3 pool ABI and integrate into `DEXPriceFeed`.
 
 ---
@@ -183,10 +184,10 @@ together deliver a releasable capability.
 > real historical execution data and delivered with continuous retraining.
 
 **Stories:**
-- [ ] **E3-S1** Persist opportunity and execution logs to PostgreSQL (`executions` table with all feature columns and `net_profit_usd` label).
-- [ ] **E3-S2** Build an ETL pipeline that extracts features from the PostgreSQL log into a training dataset.
+- [x] **E3-S1** Persist opportunity and execution logs to PostgreSQL (`executions` table with all feature columns and `net_profit_usd` label). *(implemented in `src/utils/db.ExecutionDB`; optional `asyncpg` dependency; graceful fallback when DB unavailable)*
+- [x] **E3-S2** Build an ETL pipeline that extracts features from the PostgreSQL log into a training dataset. *(implemented in `src/ml/etl`; `load_training_data()`, `merge_with_synthetic()`)*
 - [x] **E3-S3** Tune `GradientBoostingRegressor` hyperparameters via `GridSearchCV` on 90-day lookback window. *(implemented in `src/ml/training.tune_hyperparameters()`)*
-- [ ] **E3-S4** Set up a weekly cron job that retrains the model and replaces `models/arbitrage_model.joblib`.
+- [x] **E3-S4** Set up a weekly cron job that retrains the model and replaces `models/arbitrage_model.joblib`. *(implemented in `scripts/retrain.py`; cron example in file header)*
 - [ ] **E3-S5** Add a model evaluation dashboard: RMSE, R², feature importances (Prometheus + Grafana or FastAPI endpoint).
 - [x] **E3-S6** Explore a secondary `RandomForestRegressor` ensemble for variance reduction. *(implemented in `src/ml/model.EnsembleModel`)*
 
@@ -199,7 +200,7 @@ together deliver a releasable capability.
 
 **Stories:**
 - [x] **E4-S1** Implement EIP-1559 gas estimation: cap `maxFeePerGas` at `MAX_GAS_PRICE_GWEI`; skip execution if base fee exceeds threshold. *(implemented in `PolygonClient.get_max_fee_params()`)*
-- [ ] **E4-S2** Add per-hop slippage protection: compute `amountOutMinimum` from expected output minus 0.5% and pass to DEX swap functions.
+- [x] **E4-S2** Add per-hop slippage protection: compute `amountOutMinimum` from expected output minus 0.5% and pass to DEX swap functions. *(implemented in `FlashLoan.compute_amounts_out_minimum()` + `execute_flash_loan()`)*
 - [x] **E4-S3** Implement exponential back-off retry in `ExecutionAgent` for RPC transient errors (up to 3 retries, max 8 s delay). *(implemented in `ExecutionAgent._execute_with_retry()`)*
 - [x] **E4-S4** Add a nonce management service that serialises concurrent transaction submissions and handles stuck transactions. *(implemented in `polygon_client.NonceManager`)*
 - [ ] **E4-S5** Implement MEV protection: submit transactions via Flashbots-compatible private mempool on zkEVM (or a bundler service).
@@ -216,7 +217,7 @@ together deliver a releasable capability.
 - [x] **E5-S1** Add a Prometheus metrics endpoint (`/metrics`) exposing: `cycle_duration_ms`, `opportunities_found_total`, `executions_total`, `profit_usd_total`, `ml_score_histogram`. *(implemented in `src/utils/metrics.ArbisyMetrics`)*
 - [ ] **E5-S2** Build a Grafana dashboard with panels for: rolling P&L, ML score distribution, gas cost trend, circuit-breaker status.
 - [x] **E5-S3** Implement structured JSON logging (via `python-json-logger`) and ship logs to a centralised store (e.g., Loki, CloudWatch). *(implemented in `src/utils/logger.py`; enable with `LOG_JSON=1`)*
-- [ ] **E5-S4** Build a minimal FastAPI + WebSocket dashboard: live opportunity feed, execution log, current model metrics.
+- [x] **E5-S4** Build a minimal FastAPI + WebSocket dashboard: live opportunity feed, execution log, current model metrics. *(implemented in `src/utils/dashboard.py`; served on port 8080 when orchestrator starts)*
 - [x] **E5-S5** Add health-check endpoint (`/healthz`) that verifies RPC connectivity and contract reachability; integrate with a watchdog (systemd / Docker). *(implemented in `src/utils/health.py`)*
 
 ---
@@ -227,8 +228,8 @@ together deliver a releasable capability.
 > cross-platform pairs.
 
 **Stories:**
-- [ ] **E6-S1** Implement 4-leg (quad-hop) arbitrage paths in the matrix solver and wire them through the execution pipeline.
-- [ ] **E6-S2** Add Balancer V2 pool support: weighted pool price calculation and swap path encoding.
+- [x] **E6-S1** Implement 4-leg (quad-hop) arbitrage paths in the matrix solver and wire them through the execution pipeline. *(matrix already detects N-leg cycles via Floyd-Warshall; `ArbitrageMatrix.build_hop_list()` now constructs swap hops for the execution pipeline)*
+- [x] **E6-S2** Add Balancer V2 pool support: weighted pool price calculation and swap path encoding. *(implemented in `src/arbitrage/balancer.BalancerArbitrage`; weighted spot-price formula; `BALANCER_VAULT` env var)*
 - [ ] **E6-S3** Add Curve Finance stable-swap pool support: invariant-based price calculation.
 - [ ] **E6-S4** Explore cross-chain arbitrage via bridges (e.g., Polygon mainnet &lt;-&gt; zkEVM) as a future research item.
 - [ ] **E6-S5** Evaluate a reinforcement-learning agent (using `stable-baselines3` sklearn-compatible wrapper) as an upgrade path for the ML model.

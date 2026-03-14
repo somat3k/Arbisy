@@ -78,6 +78,16 @@ class PolygonClient:
 
     # ── Connectivity ──────────────────────────────────────────────────────────
 
+    @property
+    def rpc_url(self) -> str:
+        """The HTTP RPC URL this client is connected to."""
+        return self._rpc_url
+
+    @property
+    def ws_url(self) -> str:
+        """The WebSocket URL for event subscriptions."""
+        return self._ws_url
+
     async def is_connected(self) -> bool:
         try:
             return await self.w3.is_connected()
