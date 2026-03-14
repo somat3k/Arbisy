@@ -158,6 +158,11 @@ class DEXPriceFeed:
         self._token_decimals: Dict[str, int] = {}
         self._token_symbols: Dict[str, str] = {}
 
+    @property
+    def pool_configs(self) -> List[Tuple[str, str]]:
+        """The list of (dex_name, pool_address) tuples monitored by this feed."""
+        return list(self._pool_configs)
+
     @staticmethod
     def _default_pools() -> List[Tuple[str, str]]:
         """

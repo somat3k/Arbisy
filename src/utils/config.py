@@ -93,6 +93,50 @@ class Config:
         "NN_MODEL_PATH", "models/neural_arb_model.joblib"
     ))
 
+    # ── Database (E3-S1) ─────────────────────────────────────────────────────
+    database_url: str = field(default_factory=lambda: _get(
+        "DATABASE_URL", ""
+    ))
+
+    # ── Token universe (E2-S4) — Polygon zkEVM mainnet addresses ─────────────
+    # WETH (Wrapped Ether)
+    token_weth: str = field(default_factory=lambda: _get(
+        "TOKEN_WETH", "0x4F9A0e7FD2Bf6067db6994CF12E4495Df938E6e9"
+    ))
+    # USDC (USD Coin — bridged)
+    token_usdc: str = field(default_factory=lambda: _get(
+        "TOKEN_USDC", "0xA8CE8aee21bC2A48a5EF670afCc9274C7bbbC035"
+    ))
+    # USDT (Tether USD — bridged)
+    token_usdt: str = field(default_factory=lambda: _get(
+        "TOKEN_USDT", "0x1E4a5963aBFD975d8c9021ce480b42188849D41d"
+    ))
+    # WMATIC (Wrapped MATIC)
+    token_wmatic: str = field(default_factory=lambda: _get(
+        "TOKEN_WMATIC", "0xa2036f0538221a77A3937F1379699f44945018d0"
+    ))
+    # WBTC (Wrapped BTC)
+    token_wbtc: str = field(default_factory=lambda: _get(
+        "TOKEN_WBTC", "0xEA034fb02eB1808C2cc3adbC15f447B93CbE08e1"
+    ))
+    # LINK (Chainlink)
+    token_link: str = field(default_factory=lambda: _get(
+        "TOKEN_LINK", "0x4B16e4752711A7ABEc32799C976F3CeFc0111f2B"
+    ))
+    # AAVE
+    token_aave: str = field(default_factory=lambda: _get(
+        "TOKEN_AAVE", "0x68791cfe079814c46e0808bad312641223e8ca0e"
+    ))
+    # DAI (Multi-Collateral DAI)
+    token_dai: str = field(default_factory=lambda: _get(
+        "TOKEN_DAI", "0xC5015b9d9161Dca7e18e32f6f25C4aD850731Fd4"
+    ))
+
+    # ── Balancer V2 (E6-S2) ───────────────────────────────────────────────────
+    balancer_vault: str = field(default_factory=lambda: _get(
+        "BALANCER_VAULT", "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
+    ))
+
 
 # Module-level singleton
 _config: Optional[Config] = None

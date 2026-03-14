@@ -200,12 +200,51 @@ class FlashLoan:
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
+    # Maximum per-hop slippage applied when computing amountOutMinimum (E4-S2).
+    # This matches the on-chain maxSlippageBps default (50 = 0.50%).
+    MAX_SLIPPAGE_PCT: float = 0.5
+
+    @staticmethod
+    def compute_amounts_out_minimum(
+        path: list,
+        slippage_pct: float = 0.5,
+    ) -> list:
+        """
+        Compute per-hop ``amountOutMinimum`` values from SwapHop.estimated_amount_out
+        with a slippage deduction (E4-S2).
+
+        Only hops with ``estimated_amount_out > 0`` produce a non-zero minimum;
+        hops with no estimate default to 0 (no minimum enforced on that hop).
+
+        Parameters
+        ----------
+        path:         List of SwapHop objects.
+        slippage_pct: Maximum allowed slippage per hop (default 0.5%).
+
+        Returns
+        -------
+        List of int ``amountOutMinimum`` values, one per hop.
+        """
+        factor = 1.0 - slippage_pct / 100.0
+        mins = []
+        for hop in path:
+            if hop.estimated_amount_out > 0:
+                mins.append(int(hop.estimated_amount_out * factor))
+            else:
+                mins.append(0)
+        return mins
+
     async def execute_flash_loan(
         self,
         opportunity: OpportunityPayload,
     ) -> Dict[str, Any]:
         """
         Build and send the flash loan transaction for a given opportunity.
+
+        Per-hop slippage protection (E4-S2): for each swap hop that has a
+        positive ``estimated_amount_out`` value, ``amountOutMinimum`` is set
+        to ``estimated_amount_out × (1 − MAX_SLIPPAGE_PCT / 100)`` and
+        encoded into the ``params`` bytes passed to the contract.
 
         Returns a dict with tx_hash, gas_used, success, error_message.
         """
@@ -215,7 +254,14 @@ class FlashLoan:
             return {"success": False, "error_message": "Private key not set"}
 
         try:
-            params = self.encode_swap_path(opportunity.path)
+            # Compute per-hop amountOutMinimum values for slippage protection (E4-S2)
+            amounts_out_min = self.compute_amounts_out_minimum(
+                opportunity.path, slippage_pct=self.MAX_SLIPPAGE_PCT
+            )
+            params = self.encode_swap_path(
+                opportunity.path,
+                expected_amounts_out=amounts_out_min,
+            )
             nonce  = await self._client.get_nonce(self._wallet)
             fee_params = await self._client.get_max_fee_params()
 
