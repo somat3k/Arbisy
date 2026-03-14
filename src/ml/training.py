@@ -16,6 +16,7 @@ import numpy as np
 
 from src.ml.feature_engineering import N_FEATURES, FEATURE_NAMES
 from src.ml.model import ArbitrageModel
+from src.ml.neural_model import NeuralArbModel
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -116,7 +117,7 @@ def train(
     synthetic_samples: int = 2000,
 ) -> Tuple[ArbitrageModel, Dict[str, float]]:
     """
-    Full training pipeline.
+    Full GBR training pipeline.
 
     1. Load real trade history (if available and `use_real_data=True`).
     2. Supplement / fallback to synthetic data.
@@ -143,5 +144,49 @@ def train(
     return model, metrics
 
 
+def train_nn(
+    model_path: Optional[str] = None,
+    use_real_data: bool = True,
+    synthetic_samples: int = 2000,
+) -> Tuple[NeuralArbModel, Dict[str, float]]:
+    """
+    Full neural network training pipeline.
+
+    Uses the same data as ``train()`` so the GBR and NN models are trained
+    on identical samples and can be fairly compared or combined in an
+    ensemble.
+
+    1. Load real trade history (if available and ``use_real_data=True``).
+    2. Supplement / fallback to synthetic data.
+    3. Fit the ``NeuralArbModel`` (sklearn MLPRegressor).
+    4. Save to disk.
+    5. Return (model, metrics).
+    """
+    X_real, y_real = load_history() if use_real_data else (None, None)
+    X_syn, y_syn   = generate_synthetic_data(synthetic_samples)
+
+    if X_real is not None and y_real is not None:
+        X = np.vstack([X_real, X_syn])
+        y = np.concatenate([y_real, y_syn])
+        log.info(
+            "NeuralArbModel: training on %d real + %d synthetic samples",
+            len(X_real), len(X_syn),
+        )
+    else:
+        X, y = X_syn, y_syn
+        log.info(
+            "NeuralArbModel: no real data — training on %d synthetic samples",
+            len(X_syn),
+        )
+
+    nn_model = NeuralArbModel(model_path=model_path)
+    metrics  = nn_model.fit(X, y, validate=True)
+    saved    = nn_model.save()
+
+    log.info("NeuralArbModel training complete. Metrics: %s → saved to %s", metrics, saved)
+    return nn_model, metrics
+
+
 if __name__ == "__main__":
     train()
+    train_nn()

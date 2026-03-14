@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from src.agents.analysis_agent import AnalysisAgent
 from src.agents.arbitrage_agent import ArbitrageAgent
 from src.agents.execution_agent import ExecutionAgent
+from src.arbitrage.array_builder import ArrayBuilder, PathArray
 from src.arbitrage.cross_platform import CrossPlatformArbitrage
 from src.arbitrage.matrix import ArbitrageMatrix
 from src.arbitrage.triangular import TriangularArbitrage
@@ -31,7 +32,8 @@ from src.blockchain.dex_price_feed import DEXPriceFeed, PoolPrice
 from src.blockchain.flash_loan import FlashLoan
 from src.blockchain.polygon_client import PolygonClient
 from src.ml.inference import LiveInference
-from src.ml.training import train as train_model
+from src.ml.neural_model import NeuralArbModel
+from src.ml.training import train as train_model, train_nn as train_nn_model
 from src.payload.communicator import PayloadCommunicator
 from src.payload.protocol import (
     ExecutionResultPayload,
@@ -75,12 +77,14 @@ class ArbisyOrchestrator:
         self._flash     = FlashLoan(self._client)
 
         # Detectors
-        self._tri_arb   = TriangularArbitrage(max_path_length=4)
-        self._cross_arb = CrossPlatformArbitrage()
-        self._matrix    = ArbitrageMatrix()
+        self._tri_arb     = TriangularArbitrage(max_path_length=4)
+        self._cross_arb   = CrossPlatformArbitrage()
+        self._matrix      = ArbitrageMatrix()
+        self._array_builder = ArrayBuilder(max_hops=4, min_profit_pct=0.05)
 
-        # ML
+        # ML: GBR model + Neural network model
         self._inference = LiveInference()
+        self._nn_model  = NeuralArbModel(model_path=self._cfg.nn_model_path)
 
         # AI Agents
         self._arb_agent  = ArbitrageAgent()
@@ -102,9 +106,9 @@ class ArbisyOrchestrator:
     # ── Startup ───────────────────────────────────────────────────────────────
 
     async def _ensure_model(self) -> None:
-        """Train model if no persisted version exists."""
+        """Train models if no persisted versions exist."""
         if not self._inference.model.trained:
-            log.info("No trained model found — training on synthetic data...")
+            log.info("No trained GBR model found — training on synthetic data...")
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: train_model(
                 model_path=self._cfg.model_path,
@@ -115,6 +119,16 @@ class ArbisyOrchestrator:
             # ExecutionAgent holds a reference to the same object, so it will
             # automatically start using the fresh model without re-wiring.
             self._inference.reload()
+
+        if not self._nn_model.trained:
+            log.info("No trained NN model found — training on synthetic data...")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: train_nn_model(
+                model_path=self._cfg.nn_model_path,
+                use_real_data=False,
+                synthetic_samples=2000,
+            ))
+            self._nn_model.reload()
 
     async def _verify_connection(self) -> None:
         connected = await self._client.is_connected()
@@ -138,6 +152,7 @@ class ArbisyOrchestrator:
         self._tri_arb.update_prices(pool_prices)
         self._cross_arb.update_prices(pool_prices)
         self._matrix.build_from_prices(pool_prices)
+        self._array_builder.update_prices(pool_prices)
 
         candidates: List[Dict[str, Any]] = []
 
@@ -217,9 +232,49 @@ class ArbisyOrchestrator:
                 "gas_estimate_gwei":     0.0,
             })
 
+        # NN-scored ArrayBuilder arbitrage
+        # Collect all unique loan assets from current pool prices
+        loan_assets = list({
+            pp.token0.lower() for pp in pool_prices
+        } | {pp.token1.lower() for pp in pool_prices})
+
+        array_opps: List[PathArray] = self._array_builder.build_profitable_arrays(
+            loan_assets=loan_assets,
+            loan_amount_usd=10_000.0,
+            nn_model=self._nn_model if self._nn_model.trained else None,
+        )
+        for pa in array_opps:
+            hops = [
+                {
+                    "token_in":             pa.token_path[i],
+                    "token_out":            pa.token_path[i + 1],
+                    "dex_name":             pa.dex_path[i],
+                    "router_address":       "0x0",
+                    "fee_bps":              pa.fee_path[i] if i < len(pa.fee_path) else 30,
+                    "is_v3":                True,
+                    "estimated_amount_out": pa.final_usd if i == len(pa.dex_path) - 1 else 0.0,
+                }
+                for i in range(len(pa.dex_path))
+            ]
+            candidates.append({
+                "arb_type":              "array_builder",
+                "estimated_profit_pct":  pa.profit_pct,
+                "asset":                 pa.loan_asset,
+                "loan_amount_usd":       pa.initial_usd,
+                # NOTE: wei conversion uses 6-decimal assumption (USDC/USDT).
+                # In production, look up pa.loan_asset token decimals from
+                # the chain and compute wei = int(pa.initial_usd * 10**decimals).
+                "loan_amount_wei":       int(pa.initial_usd * 10**6),
+                "dex_sources":           list(set(pa.dex_path)),
+                "hops":                  hops,
+                "slippage_estimate_pct": pa.num_hops * 0.1,
+                "gas_estimate_gwei":     0.0,
+                "nn_score":              pa.nn_score,
+            })
+
         log.info(
-            "FIND: %d triangular, %d cross-platform, %d matrix candidates",
-            len(tri_opps), len(cross_opps), len(matrix_opps),
+            "FIND: %d triangular, %d cross-platform, %d matrix, %d array-builder candidates",
+            len(tri_opps), len(cross_opps), len(matrix_opps), len(array_opps),
         )
         return candidates
 

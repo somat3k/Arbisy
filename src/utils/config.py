@@ -89,6 +89,9 @@ class Config:
     model_path: str = field(default_factory=lambda: _get(
         "MODEL_PATH", "models/arbitrage_model.joblib"
     ))
+    nn_model_path: str = field(default_factory=lambda: _get(
+        "NN_MODEL_PATH", "models/neural_arb_model.joblib"
+    ))
 
 
 # Module-level singleton

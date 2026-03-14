@@ -1,5 +1,6 @@
 """
-Tests for ML components: feature engineering, model, training, inference.
+Tests for ML components: feature engineering, model, training, inference,
+and neural network model.
 """
 
 from __future__ import annotations
@@ -13,7 +14,8 @@ import pytest
 from src.ml.feature_engineering import FeatureEngineer, FeatureVector, N_FEATURES, FEATURE_NAMES
 from src.ml.inference import LiveInference
 from src.ml.model import ArbitrageModel
-from src.ml.training import generate_synthetic_data
+from src.ml.neural_model import NeuralArbModel
+from src.ml.training import generate_synthetic_data, train_nn
 from src.payload.protocol import OpportunityPayload, Priority, SwapHop
 
 
@@ -195,3 +197,95 @@ class TestLiveInference:
         infer.record_outcome("triangular", False)
         rate = infer.fe.historical_success_rate("triangular")
         assert abs(rate - 0.5) < 1e-9
+
+
+# ── NeuralArbModel ────────────────────────────────────────────────────────────
+
+class TestNeuralArbModel:
+    def test_heuristic_predict_without_training(self) -> None:
+        model = NeuralArbModel(model_path="/tmp/nonexistent_nn_model.joblib")
+        X, _ = generate_synthetic_data(10)
+        preds = model.predict(X)
+        assert preds.shape == (10,)
+        assert not np.any(np.isnan(preds))
+
+    def test_train_and_predict(self) -> None:
+        model = NeuralArbModel(model_path="/tmp/test_nn_model.joblib")
+        X, y  = generate_synthetic_data(200)
+        metrics = model.fit(X, y, validate=True)
+        assert "train_rmse" in metrics
+        assert metrics["train_rmse"] >= 0
+        assert model.trained
+
+        preds = model.predict(X[:5])
+        assert preds.shape == (5,)
+        assert not np.any(np.isnan(preds))
+
+    def test_predict_score_range(self) -> None:
+        model = NeuralArbModel(model_path="/tmp/test_nn_model2.joblib")
+        X, y  = generate_synthetic_data(100)
+        model.fit(X, y, validate=False)
+        score = model.predict_score(X[0])
+        assert 0.0 <= score <= 1.0
+
+    def test_predict_score_1d_input(self) -> None:
+        """predict_score must accept a 1-D array."""
+        model = NeuralArbModel(model_path="/tmp/test_nn_model3.joblib")
+        X, y  = generate_synthetic_data(100)
+        model.fit(X, y, validate=False)
+        score = model.predict_score(X[0])  # shape (N_FEATURES,)
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+    def test_save_and_reload(self, tmp_path) -> None:
+        path  = str(tmp_path / "nn_model.joblib")
+        model = NeuralArbModel(model_path=path)
+        X, y  = generate_synthetic_data(100)
+        model.fit(X, y, validate=False)
+        model.save(path)
+
+        model2 = NeuralArbModel(model_path=path)
+        assert model2.trained
+        p1 = model.predict(X[:3])
+        p2 = model2.predict(X[:3])
+        np.testing.assert_allclose(p1, p2, rtol=1e-5)
+
+    def test_reload_method(self, tmp_path) -> None:
+        path  = str(tmp_path / "nn_reload.joblib")
+        model = NeuralArbModel(model_path=path)
+        X, y  = generate_synthetic_data(100)
+        model.fit(X, y, validate=False)
+        model.save(path)
+
+        # Create a second instance that picks up the saved file
+        model2 = NeuralArbModel(model_path=path)
+        assert model2.trained
+        # Call reload again (idempotent)
+        model2.reload()
+        assert model2.trained
+
+    def test_train_nn_pipeline(self, tmp_path) -> None:
+        path     = str(tmp_path / "pipeline_nn.joblib")
+        nn, metrics = train_nn(
+            model_path=path,
+            use_real_data=False,
+            synthetic_samples=300,
+        )
+        assert nn.trained
+        assert "train_rmse" in metrics
+        assert metrics["train_rmse"] >= 0
+
+    def test_nn_and_gbr_same_feature_interface(self) -> None:
+        """Both models must accept the same 15-feature input."""
+        gbr = ArbitrageModel(model_path="/tmp/gbr_iface.joblib")
+        nn  = NeuralArbModel(model_path="/tmp/nn_iface.joblib")
+        X, y = generate_synthetic_data(100)
+        gbr.fit(X, y, validate=False)
+        nn.fit(X, y, validate=False)
+
+        sample = X[0]
+        gbr_score = gbr.predict_score(sample)
+        nn_score  = nn.predict_score(sample)
+        # Both scores must be in [0, 1]
+        assert 0.0 <= gbr_score <= 1.0
+        assert 0.0 <= nn_score  <= 1.0
